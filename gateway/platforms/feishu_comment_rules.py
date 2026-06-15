@@ -45,6 +45,7 @@ class CommentDocumentRule:
     enabled: Optional[bool] = None
     policy: Optional[str] = None
     allow_from: Optional[frozenset] = None
+    require_mention: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class CommentsConfig:
     enabled: bool = True
     policy: str = "pairing"
     allow_from: frozenset = field(default_factory=frozenset)
+    require_mention: bool = True
     documents: Dict[str, CommentDocumentRule] = field(default_factory=dict)
 
 
@@ -63,6 +65,7 @@ class ResolvedCommentRule:
     policy: str
     allow_from: frozenset
     match_source: str  # e.g. "exact:docx:xxx" | "wildcard" | "top" | "default"
+    require_mention: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +133,15 @@ def _parse_document_rule(raw: dict) -> CommentDocumentRule:
         if policy not in _VALID_POLICIES:
             policy = None
     allow_from = _parse_frozenset(raw.get("allow_from"))
-    return CommentDocumentRule(enabled=enabled, policy=policy, allow_from=allow_from)
+    require_mention = raw.get("require_mention")
+    if require_mention is not None:
+        require_mention = bool(require_mention)
+    return CommentDocumentRule(
+        enabled=enabled,
+        policy=policy,
+        allow_from=allow_from,
+        require_mention=require_mention,
+    )
 
 
 def load_config() -> CommentsConfig:
@@ -154,6 +165,7 @@ def load_config() -> CommentsConfig:
         enabled=raw.get("enabled", True),
         policy=policy,
         allow_from=_parse_frozenset(raw.get("allow_from")) or frozenset(),
+        require_mention=bool(raw.get("require_mention", True)),
         documents=documents,
     )
 
@@ -201,11 +213,12 @@ def resolve_rule(
     enabled, en_src = _pick("enabled")
     policy, pol_src = _pick("policy")
     allow_from, _ = _pick("allow_from")
+    require_mention, rm_src = _pick("require_mention")
 
     # match_source = highest-priority tier that contributed any field
     priority_order = {"exact": 0, "wildcard": 1, "top": 2}
     best_src = min(
-        [en_src, pol_src],
+        [en_src, pol_src, rm_src],
         key=lambda s: priority_order.get(s.split(":")[0], 3),
     )
 
@@ -214,6 +227,7 @@ def resolve_rule(
         policy=policy,
         allow_from=allow_from,
         match_source=best_src,
+        require_mention=require_mention,
     )
 
 
@@ -303,9 +317,10 @@ def _print_status() -> None:
     print(f"  exists: {PAIRING_FILE.exists()}")
     print()
     print(f"Top-level:")
-    print(f"  enabled:    {cfg.enabled}")
-    print(f"  policy:     {cfg.policy}")
-    print(f"  allow_from: {sorted(cfg.allow_from) if cfg.allow_from else '[]'}")
+    print(f"  enabled:         {cfg.enabled}")
+    print(f"  policy:          {cfg.policy}")
+    print(f"  allow_from:      {sorted(cfg.allow_from) if cfg.allow_from else '[]'}")
+    print(f"  require_mention: {cfg.require_mention}")
     print()
     if cfg.documents:
         print(f"Document rules ({len(cfg.documents)}):")
@@ -317,6 +332,8 @@ def _print_status() -> None:
                 parts.append(f"policy={rule.policy}")
             if rule.allow_from is not None:
                 parts.append(f"allow_from={sorted(rule.allow_from)}")
+            if rule.require_mention is not None:
+                parts.append(f"require_mention={rule.require_mention}")
             print(f"  [{key}] {', '.join(parts) if parts else '(empty — inherits all)'}")
     else:
         print("Document rules: (none)")
@@ -340,11 +357,16 @@ def _do_check(doc_key: str, user_open_id: str) -> None:
     print(f"Document:     {doc_key}")
     print(f"User:         {user_open_id}")
     print(f"Resolved rule:")
-    print(f"  enabled:      {rule.enabled}")
-    print(f"  policy:       {rule.policy}")
-    print(f"  allow_from:   {sorted(rule.allow_from) if rule.allow_from else '[]'}")
-    print(f"  match_source: {rule.match_source}")
+    print(f"  enabled:         {rule.enabled}")
+    print(f"  policy:          {rule.policy}")
+    print(f"  allow_from:      {sorted(rule.allow_from) if rule.allow_from else '[]'}")
+    print(f"  require_mention: {rule.require_mention}")
+    print(f"  match_source:    {rule.match_source}")
     print(f"Result:       {'ALLOWED' if allowed else 'DENIED'}")
+    print(
+        "Note: a real event is also dropped before this gate unless "
+        f"is_mentioned=true (require_mention={rule.require_mention})."
+    )
 
 
 def _main() -> int:

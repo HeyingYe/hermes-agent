@@ -51,6 +51,11 @@ class TestCommentDocumentRuleParsing(unittest.TestCase):
         rule = _parse_document_rule({"policy": "invalid_value"})
         self.assertIsNone(rule.policy)
 
+    def test_parse_require_mention(self):
+        self.assertFalse(_parse_document_rule({"require_mention": False}).require_mention)
+        self.assertTrue(_parse_document_rule({"require_mention": True}).require_mention)
+        self.assertIsNone(_parse_document_rule({}).require_mention)
+
 
 class TestResolveRule(unittest.TestCase):
     def test_exact_match(self):
@@ -154,6 +159,43 @@ class TestResolveRule(unittest.TestCase):
         self.assertTrue(rule.enabled)
         self.assertEqual(rule.policy, "pairing")
         self.assertEqual(rule.allow_from, frozenset())
+
+    def test_require_mention_defaults_true(self):
+        """No config → require_mention must default to true (privacy-safe)."""
+        cfg = CommentsConfig()
+        rule = resolve_rule(cfg, "docx", "anything")
+        self.assertTrue(rule.require_mention)
+
+    def test_require_mention_top_level_override(self):
+        cfg = CommentsConfig(require_mention=False)
+        rule = resolve_rule(cfg, "docx", "anything")
+        self.assertFalse(rule.require_mention)
+
+    def test_require_mention_per_document_override(self):
+        """Exact doc may opt out of the mention gate while top-level stays true."""
+        cfg = CommentsConfig(
+            require_mention=True,
+            documents={
+                "docx:abc": CommentDocumentRule(require_mention=False),
+            },
+        )
+        exact = resolve_rule(cfg, "docx", "abc")
+        self.assertFalse(exact.require_mention)
+        other = resolve_rule(cfg, "docx", "other")
+        self.assertTrue(other.require_mention)
+
+    def test_require_mention_field_by_field_resolution(self):
+        """exact > wildcard > top-level, resolved independently per field."""
+        cfg = CommentsConfig(
+            require_mention=True,
+            documents={
+                "*": CommentDocumentRule(require_mention=False),
+                "docx:abc": CommentDocumentRule(policy="allowlist"),
+            },
+        )
+        # docx:abc has no require_mention → falls through to wildcard (false)
+        rule = resolve_rule(cfg, "docx", "abc")
+        self.assertFalse(rule.require_mention)
 
 
 class TestHasWikiKeys(unittest.TestCase):
@@ -274,7 +316,26 @@ class TestLoadConfig(unittest.TestCase):
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.policy, "pairing")
         self.assertEqual(cfg.allow_from, frozenset())
+        self.assertTrue(cfg.require_mention)
         self.assertEqual(cfg.documents, {})
+
+    def test_load_require_mention_fields(self):
+        raw = {
+            "require_mention": False,
+            "documents": {
+                "docx:abc": {"require_mention": True},
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(raw, f)
+            path = Path(f.name)
+        try:
+            with patch("gateway.platforms.feishu_comment_rules._rules_cache", _MtimeCache(path)):
+                cfg = load_config()
+            self.assertFalse(cfg.require_mention)
+            self.assertTrue(cfg.documents["docx:abc"].require_mention)
+        finally:
+            path.unlink()
 
 
 class TestPairingStore(unittest.TestCase):
