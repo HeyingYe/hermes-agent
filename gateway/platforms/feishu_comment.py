@@ -1178,6 +1178,16 @@ async def handle_drive_comment_event(
     if not rule.enabled:
         logger.info("[Feishu-Comment] Comments disabled for %s:%s, skipping", file_type, file_token)
         return
+    # Mention gate: unless explicitly opted out (require_mention=false) for this
+    # document, only reply when the event @-mentions the bot. Enforced before
+    # access-control and any reply-side API call so ordinary comments never
+    # trigger a reaction or the agent.
+    if rule.require_mention and not parsed["is_mentioned"]:
+        logger.info(
+            "[Feishu-Comment] Event not mentioned and require_mention=true for %s:%s (rule=%s), skipping",
+            file_type, file_token, rule.match_source,
+        )
+        return
     if not is_user_allowed(rule, from_open_id):
         logger.info("[Feishu-Comment] User %s denied (policy=%s, rule=%s)", from_open_id, rule.policy, rule.match_source)
         return
