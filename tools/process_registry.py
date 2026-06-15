@@ -86,6 +86,95 @@ def format_uptime_short(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+def _kanban_bridge_enabled() -> bool:
+    """Whether spawned background processes should mirror onto the Kanban board.
+
+    Defaults to the config value ``kanban.track_background_processes``.
+    Dashboard-centric deployments want every concurrent/background task to
+    appear on the board, while other users can still disable this globally or
+    per-process by setting ``HERMES_KANBAN_TRACK_BACKGROUND=0``.
+    """
+    env = os.environ.get("HERMES_KANBAN_TRACK_BACKGROUND")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        return bool(kcfg.get("track_background_processes", True))
+    except Exception:
+        return True
+
+
+def _kanban_bridge_create(session: "ProcessSession") -> None:
+    """Best-effort: create a 'running' Kanban card mirroring this background task.
+
+    The card carries no claim/run and is never picked up by the dispatcher
+    (``release_stale_claims`` only touches tasks with ``claim_expires`` set, and
+    the dispatcher only spawns 'ready' tasks), so it is a pure visibility row
+    that lands on the Jarvis Dashboard. Never raises — a board/DB hiccup must
+    not break process spawning.
+    """
+    if not _kanban_bridge_enabled():
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+        first_line = (session.command or "").strip().splitlines()[0] if session.command.strip() else ""
+        title = ("[bg] " + (first_line[:116] or "background process"))
+        assignee = os.environ.get("HERMES_PROFILE") or "background"
+        with kb.connect_closing() as conn:
+            tid = kb.create_task(
+                conn,
+                title=title,
+                body=session.command,
+                assignee=assignee,
+                created_by=assignee,
+                workspace_kind="scratch",
+                initial_status="running",
+                session_id=session.session_key or None,
+                # Idempotent on the process session id so a checkpoint-recovery
+                # or duplicate spawn call can't create a second card.
+                idempotency_key=f"bgproc:{session.id}",
+            )
+            # Visibility-only cards should appear as running immediately.
+            # create_task() intentionally recomputes non-blocked statuses as
+            # ready/todo for normal dispatcher work, so do a narrow post-create
+            # transition here instead of widening create_task's public status
+            # semantics.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', last_heartbeat_at = ? WHERE id = ?",
+                    (int(time.time()), tid),
+                )
+        session.kanban_task_id = tid
+        # A very short-lived background process can exit between spawn and the
+        # bridge card creation path (reader/poller thread wins the race). In
+        # that case _move_to_finished() has already run with no kanban_task_id
+        # to close, so close the visibility card immediately after linking it.
+        if session.exited:
+            _kanban_bridge_finish(session)
+    except Exception:
+        logger.debug("kanban bridge: create card failed", exc_info=True)
+
+
+def _kanban_bridge_finish(session: "ProcessSession") -> None:
+    """Best-effort: close the mirrored Kanban card when the process exits."""
+    tid = getattr(session, "kanban_task_id", "")
+    if not tid:
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+        code = session.exit_code
+        if code in (0, None):
+            summary = f"Background process {session.id} exited (code {code})."
+        else:
+            summary = f"Background process {session.id} exited non-zero (code {code})."
+        with kb.connect_closing() as conn:
+            kb.complete_task(conn, tid, summary=summary, result=f"exit_code={code}")
+    except Exception:
+        logger.debug("kanban bridge: complete card failed", exc_info=True)
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -104,6 +193,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    kanban_task_id: str = ""                    # Kanban card id when the background-process→board bridge is on
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -576,6 +666,7 @@ class ProcessRegistry:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
+                _kanban_bridge_create(session)
                 self._write_checkpoint()
                 return session
 
@@ -627,6 +718,7 @@ class ProcessRegistry:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
+            _kanban_bridge_create(session)
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
@@ -743,6 +835,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
         if not session.exited:
+            _kanban_bridge_create(session)
             self._write_checkpoint()
 
         return session
@@ -872,6 +965,8 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
+        if was_running:
+            _kanban_bridge_finish(session)
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
@@ -1408,6 +1503,7 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "kanban_task_id": s.kanban_task_id,
                         })
             
             # Atomic write to avoid corruption on crash
@@ -1472,6 +1568,7 @@ class ProcessRegistry:
                     watcher_interval=entry.get("watcher_interval", 0),
                     notify_on_complete=entry.get("notify_on_complete", False),
                     watch_patterns=entry.get("watch_patterns", []),
+                    kanban_task_id=entry.get("kanban_task_id", ""),
                 )
                 with self._lock:
                     self._running[session.id] = session
