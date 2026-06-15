@@ -8,14 +8,17 @@ import sys
 import threading
 import time
 import pytest
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+import tools.process_registry as process_registry
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
+    _kanban_bridge_enabled,
 )
 
 
@@ -100,6 +103,70 @@ def test_write_stdin_uses_bytes_for_posix_pty(monkeypatch, registry):
 
     assert result == {"status": "ok", "bytes_written": 6}
     assert written == [b"hello\n"]
+
+
+def test_kanban_background_bridge_defaults_on(monkeypatch):
+    """Jarvis Dashboard should see ad-hoc concurrent/background tasks by default."""
+    monkeypatch.delenv("HERMES_KANBAN_TRACK_BACKGROUND", raising=False)
+    import hermes_cli.config as config
+    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {}})
+
+    assert _kanban_bridge_enabled() is True
+
+
+def test_kanban_background_bridge_env_can_disable(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TRACK_BACKGROUND", "0")
+
+    assert _kanban_bridge_enabled() is False
+
+
+def test_kanban_background_bridge_finishes_already_exited_session(monkeypatch):
+    """Fast processes can exit before their Kanban card is created; close the card."""
+    calls = []
+
+    class _Conn:
+        def execute(self, query, params=()):
+            calls.append(("execute", query, params))
+
+    @contextmanager
+    def _connect_closing():
+        yield _Conn()
+
+    @contextmanager
+    def _write_txn(conn):
+        yield conn
+
+    def _create_task(conn, **kwargs):
+        calls.append(("create", kwargs))
+        return "t_bgfast"
+
+    def _complete_task(conn, task_id, **kwargs):
+        calls.append(("complete", task_id, kwargs))
+        return True
+
+    monkeypatch.setattr(process_registry, "_kanban_bridge_enabled", lambda: True)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect_closing", _connect_closing)
+    monkeypatch.setattr("hermes_cli.kanban_db.write_txn", _write_txn)
+    monkeypatch.setattr("hermes_cli.kanban_db.create_task", _create_task)
+    monkeypatch.setattr("hermes_cli.kanban_db.complete_task", _complete_task)
+
+    session = ProcessSession(
+        id="proc_fast",
+        command="python -c 'print(1)'",
+        exited=True,
+        exit_code=0,
+    )
+
+    process_registry._kanban_bridge_create(session)
+
+    assert session.kanban_task_id == "t_bgfast"
+    assert any(call[0] == "create" for call in calls)
+    assert any(
+        call[0] == "complete"
+        and call[1] == "t_bgfast"
+        and call[2]["result"] == "exit_code=0"
+        for call in calls
+    )
 
 
 # =========================================================================
