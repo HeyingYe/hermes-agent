@@ -2298,6 +2298,13 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Mirror terminal(background=true) / PTY / env-backed background
+        # processes onto the Kanban board as visibility-only cards. This is
+        # what makes ad-hoc concurrent work show up in Jarvis Dashboard even
+        # when it was not originally spawned by the Kanban dispatcher. Operators
+        # can disable globally in config or per-process with
+        # HERMES_KANBAN_TRACK_BACKGROUND=0.
+        "track_background_processes": True,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
