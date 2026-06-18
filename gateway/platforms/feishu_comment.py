@@ -993,6 +993,33 @@ def _resolve_model_and_runtime() -> Tuple[str, dict]:
     return model, runtime_kwargs
 
 
+def _resolve_fallback_model() -> list | None:
+    """Load the gateway fallback provider chain for comment-agent calls."""
+    try:
+        from gateway.run import _load_gateway_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        chain = get_fallback_chain(_load_gateway_config())
+        return chain or None
+    except Exception as exc:
+        logger.debug("[Feishu-Comment] Failed to resolve fallback model chain: %s", exc)
+        return None
+
+
+def _is_internal_agent_error_response(response: str) -> bool:
+    """True when run_conversation returned infrastructure failure text."""
+    text = (response or "").strip()
+    if not text:
+        return False
+    prefixes = (
+        "API call failed after ",
+        "API call failed:",
+    )
+    if text.startswith(prefixes):
+        return True
+    return "HTTP 429" in text and "monthly spend limit" in text
+
+
 # ---------------------------------------------------------------------------
 # Session cache for cross-card memory within the same document
 # ---------------------------------------------------------------------------
@@ -1078,6 +1105,7 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             provider=runtime_kwargs.get("provider"),
             api_mode=runtime_kwargs.get("api_mode"),
             credential_pool=runtime_kwargs.get("credential_pool"),
+            fallback_model=_resolve_fallback_model(),
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -1364,7 +1392,9 @@ async def handle_drive_comment_event(
         None, _run_comment_agent, prompt, client, sess_key,
     )
 
-    if not response or _NO_REPLY_SENTINEL in response:
+    if _is_internal_agent_error_response(response):
+        logger.error("[Feishu-Comment] Agent returned internal API error; suppressing comment delivery: %s", response[:200])
+    elif not response or _NO_REPLY_SENTINEL in response:
         logger.info("[Feishu-Comment] Agent returned NO_REPLY, skipping delivery")
     else:
         logger.info("[Feishu-Comment] Agent response (%d chars): %s", len(response), response[:200])

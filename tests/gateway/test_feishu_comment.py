@@ -12,6 +12,67 @@ from gateway.platforms.feishu_comment import (
 )
 
 
+class TestCommentAgentRuntime(unittest.TestCase):
+    @patch("tools.feishu_drive_tool.set_client")
+    @patch("tools.feishu_doc_tool.set_client")
+    @patch("run_agent.AIAgent")
+    @patch("gateway.platforms.feishu_comment._resolve_fallback_model")
+    @patch("gateway.platforms.feishu_comment._resolve_model_and_runtime")
+    def test_comment_agent_passes_fallback_chain(
+        self, mock_runtime, mock_fallback, mock_agent_cls, mock_set_doc, mock_set_drive,
+    ):
+        from gateway.platforms.feishu_comment import _run_comment_agent
+
+        fallback = [{"provider": "custom:subcode", "model": "gpt-5.5"}]
+        mock_runtime.return_value = ("claude-opus-4-8", {"provider": "anthropic", "api_key": "k"})
+        mock_fallback.return_value = fallback
+        mock_agent = Mock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok", "api_calls": 1, "messages": []}
+        mock_agent_cls.return_value = mock_agent
+
+        response = _run_comment_agent("prompt", Mock(), "comment-doc:docx:d1")
+
+        self.assertEqual(response, "ok")
+        self.assertEqual(mock_agent_cls.call_args.kwargs["fallback_model"], fallback)
+
+
+class TestInternalApiErrorFiltering(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @patch("gateway.platforms.feishu_comment.delete_comment_reaction", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment.deliver_comment_reply", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment._run_comment_agent")
+    @patch("gateway.platforms.feishu_comment.list_comment_replies", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment.batch_query_comment", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment.query_document_meta", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment.add_comment_reaction", new_callable=AsyncMock)
+    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
+    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=True)
+    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
+    @patch("gateway.platforms.feishu_comment_rules.load_config")
+    def test_internal_api_error_response_is_not_delivered_to_comment(
+        self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys,
+        mock_reaction, mock_meta, mock_batch, mock_replies, mock_agent,
+        mock_deliver, mock_delete_reaction,
+    ):
+        from gateway.platforms.feishu_comment import handle_drive_comment_event
+        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+
+        mock_resolve.return_value = ResolvedCommentRule(True, "pairing", frozenset(), "top")
+        mock_load.return_value = Mock()
+        mock_meta.return_value = {"title": "Doc", "url": "https://example/docx/d1"}
+        mock_batch.return_value = {"is_whole": False, "quote": "quoted"}
+        mock_replies.return_value = [
+            {"reply_id": "r1", "user_id": "ou_user", "content": {"elements": [{"type": "text_run", "text_run": {"text": "@Jarvis why"}}]}},
+        ]
+        mock_agent.return_value = "API call failed after 3 retries: HTTP 429: monthly spend limit"
+
+        self._run(handle_drive_comment_event(Mock(), _make_event(), self_open_id="ou_bot"))
+
+        mock_deliver.assert_not_called()
+
+
 def _make_event(
     comment_id="c1",
     reply_id="r1",
