@@ -1,0 +1,185 @@
+<title>Hermes 分布式执行架构方案：Central Brain + Runtime Hub + Mac Workers</title>
+
+<callout emoji="📌" background-color="light-blue" border-color="blue">
+  <p><b>目标</b>：在保留 Central Hermes 唯一大脑与 canonical 状态的前提下，将调度、worker 匹配、lease、重试、日志与产物沉淀下放到 Mac mini Runtime Hub，并让多台 Mac Worker 通过 pull / long-poll 主动领取任务，最终由 Central Hermes 更新 Kanban 并通知 Boss。</p>
+</callout>
+
+<h1>1. 一句话架构</h1>
+<p>Central Hermes 只负责“想什么、记什么、决定什么”；Mac mini Runtime Hub 负责“派什么、谁来跑、跑失败怎么办”；各 Mac Worker 负责“实际执行”；Artifact Store 负责“完整证据链”；Kanban / Dashboard 负责“任务事实与对 Boss 的可见状态”。</p>
+
+<table>
+  <thead><tr><th background-color="light-gray">层级</th><th background-color="light-gray">职责边界</th><th background-color="light-gray">不应该做的事</th></tr></thead>
+  <tbody>
+    <tr><td><b>Central Hermes</b></td><td>唯一大脑、用户对话、规划、canonical state、Kanban 状态更新、最终通知</td><td>不直接跑重任务；不持有 live worker 细节；不把 runtime 临时状态当长期记忆</td></tr>
+    <tr><td><b>Mac mini Runtime Hub</b></td><td>任务调度、队列、worker 匹配、lease、心跳、重试、结果转发</td><td>不做最终业务判断；不成为第二个大脑；不篡改 canonical task intent</td></tr>
+    <tr><td><b>Mac Workers</b></td><td>通过 pull / long-poll 拉取匹配任务，执行 CLI / 浏览器 / 本地工具，上传日志和产物</td><td>不主动接收公网推送；不直接改 Central Hermes 状态；不绕过权限边界</td></tr>
+    <tr><td><b>Artifact Store</b></td><td>保存 stdout/stderr、结构化事件、截图、文件、trace、最终产物</td><td>不承载调度决策；不只保存摘要而丢失原始证据</td></tr>
+  </tbody>
+</table>
+
+<h1>2. 核心原则</h1>
+<ol>
+  <li seq="auto"><b>Central Hermes 是唯一 canonical brain</b>：用户意图、任务拆解、验收口径、Kanban 最终状态都以 Central Hermes 为准。</li>
+  <li seq="auto"><b>Runtime Hub 是执行控制面，不是第二大脑</b>：它可以调度、租约、重试、转发结果，但不能自行改变任务目标。</li>
+  <li seq="auto"><b>Worker 只 pull，不被动暴露</b>：Mac Worker 主动 long-poll 拉任务，避免每台 Mac 暴露公网入口。</li>
+  <li seq="auto"><b>所有执行必须可追溯</b>：任务从创建、匹配、开始、心跳、失败、重试、完成到通知，都写入事件流和 Artifact Store。</li>
+  <li seq="auto"><b>状态分层</b>：Kanban 是业务状态；Runtime DB 是运行状态；Artifact Store 是证据；Memory 只保存长期稳定偏好和环境事实。</li>
+</ol>
+
+<h1>3. 端到端流程</h1>
+<whiteboard type="mermaid">
+sequenceDiagram
+  participant Boss
+  participant CH as Central Hermes
+  participant KB as Kanban / Dashboard
+  participant RH as Mac mini Runtime Hub
+  participant W as Mac Worker
+  participant AS as Artifact Store
+
+  Boss->>CH: 提出任务 / 确认执行
+  CH->>KB: 创建或更新任务卡片（canonical state）
+  CH->>RH: 提交可执行 Job Spec
+  RH->>RH: 入队、计算 capability、等待 worker
+  W->>RH: long-poll 拉取匹配任务
+  RH->>W: 下发任务 + lease + sandbox 参数
+  W->>AS: 持续上传日志、截图、文件、trace
+  W->>RH: 心跳 / 进度 / 完成或失败
+  RH->>RH: lease 续约、失败重试、幂等去重
+  RH->>CH: 回传结构化结果 + artifact refs
+  CH->>KB: 验收并更新 Kanban 状态
+  CH->>Boss: 通知结果、证据链接和下一步
+</whiteboard>
+
+<h1>4. 组件设计</h1>
+<h2>4.1 Central Hermes</h2>
+<ul>
+  <li><b>职责</b>：用户对话入口、任务理解、计划生成、风险确认、验收标准、最终状态更新。</li>
+  <li><b>状态</b>：Kanban card、任务 intent、用户确认记录、最终 summary、artifact 引用。</li>
+  <li><b>接口</b>：向 Runtime Hub 提交 Job Spec；接收 Runtime Hub 的 Job Result；写回 Kanban / Dashboard；通知 Boss。</li>
+</ul>
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p>Central Hermes 不需要知道某台 Worker 的临时进程细节，只需要拿到“是否完成、如何验证、证据在哪里、是否需要人工决策”。</p>
+</callout>
+
+<h2>4.2 Mac mini Runtime Hub</h2>
+<ul>
+  <li><b>队列</b>：维护 pending / leased / running / retrying / completed / failed。</li>
+  <li><b>匹配</b>：按 capability、profile、toolset、资源、权限域、数据本地性选择 Worker。</li>
+  <li><b>Lease</b>：每个任务发放短租约；Worker 定期续约；超时自动回收。</li>
+  <li><b>重试</b>：区分 transient、environment、permission、logic failure；只对安全任务自动重试。</li>
+  <li><b>转发</b>：将最终结果和 artifact refs 回给 Central Hermes。</li>
+</ul>
+
+<h2>4.3 Mac Worker</h2>
+<ul>
+  <li>启动后注册 capabilities：模型/CLI、浏览器能力、Xcode/Node/Python、Lark/GitHub 权限、GPU/内存、工作目录白名单。</li>
+  <li>通过 pull / long-poll 请求任务，不需要公网入站端口。</li>
+  <li>执行时创建 isolated workspace，注入最小必要上下文和短期凭证。</li>
+  <li>持续上传结构化事件、stdout/stderr、截图、产物和最终 summary。</li>
+</ul>
+
+<h2>4.4 Artifact Store</h2>
+<table>
+  <thead><tr><th background-color="light-gray">Artifact 类型</th><th background-color="light-gray">用途</th><th background-color="light-gray">保留策略</th></tr></thead>
+  <tbody>
+    <tr><td>logs</td><td>stdout/stderr、agent transcript、工具输出</td><td>默认保留，敏感字段脱敏</td></tr>
+    <tr><td>files</td><td>生成的文档、patch、报告、压缩包</td><td>按任务关联，支持下载</td></tr>
+    <tr><td>screenshots</td><td>浏览器/UI 验证证据</td><td>验收型任务强制保存</td></tr>
+    <tr><td>trace</td><td>状态机事件、lease 变更、retry 原因</td><td>用于排障和审计</td></tr>
+  </tbody>
+</table>
+
+<h1>5. Job Spec 建议</h1>
+<pre lang="yaml" caption="Runtime Hub 接收的 Job Spec 示例"><code>job_id: job_20260619_001
+source: central-hermes
+kanban_card_id: card_xxx
+priority: normal
+required_capabilities:
+  - macos
+  - browser
+  - lark-cli:user
+  - git
+allowed_workers:
+  - worker-macstudio-01
+  - worker-macmini-02
+lease_ttl_seconds: 300
+max_attempts: 3
+idempotency_key: kanban_card_id + task_revision
+artifact_policy:
+  upload_stdout: true
+  upload_screenshots: on_browser_task
+  redact_secrets: true
+prompt: |
+  读 KICKOFF.md，按计划执行。完成后返回验证命令、结果和 artifact refs。
+acceptance:
+  - tests_passed
+  - artifact_uploaded
+  - summary_returned</code></pre>
+
+<h1>6. 状态机</h1>
+<table>
+  <thead><tr><th background-color="light-gray">状态</th><th background-color="light-gray">进入条件</th><th background-color="light-gray">退出条件</th></tr></thead>
+  <tbody>
+    <tr><td>queued</td><td>Central Hermes 提交 Job Spec</td><td>Runtime Hub 找到可用 Worker</td></tr>
+    <tr><td>leased</td><td>Worker 拉取任务并获得 lease</td><td>Worker ACK 开始执行，或 lease 超时回收</td></tr>
+    <tr><td>running</td><td>Worker 周期性心跳</td><td>完成、失败、取消或心跳超时</td></tr>
+    <tr><td>retrying</td><td>可重试失败且 attempts 未耗尽</td><td>重新入队或升级为 failed</td></tr>
+    <tr><td>completed</td><td>Worker 返回结果且 Artifact Store 写入成功</td><td>Central Hermes 验收并更新 Kanban</td></tr>
+    <tr><td>failed</td><td>不可重试失败或重试耗尽</td><td>Central Hermes 通知 Boss 并请求决策</td></tr>
+  </tbody>
+</table>
+
+<h1>7. 安全与权限边界</h1>
+<ul>
+  <li><b>最小权限</b>：Worker 只拿执行当前任务所需的 profile、token、目录和网络访问。</li>
+  <li><b>外发确认</b>：发消息、邀请进群、权限变更、删除、生产写入等高风险动作仍由 Central Hermes 触发确认。</li>
+  <li><b>密钥不入日志</b>：Runtime Hub 和 Worker 必须统一做 secret redaction；Artifact Store 保存脱敏版本。</li>
+  <li><b>租约隔离</b>：lease token 只对单个 job 有效，过期不可续用。</li>
+  <li><b>Worker allowlist</b>：只有登记过并通过签名认证的 Worker 可以拉任务。</li>
+</ul>
+
+<h1>8. Cron 与配置治理</h1>
+<callout emoji="💡" background-color="light-yellow" border-color="yellow">
+  <p>Cron 是状态和配置的混合体，不建议直接 Git 管 live <code>~/.hermes/cron/jobs.json</code>。建议保留 live cron 在 Mac mini，本地运行；desired cron 以 YAML 模板进入 Git。</p>
+</callout>
+<pre lang="text" caption="推荐目录分层"><code>live cron:    Mac mini ~/.hermes/cron/jobs.json
+desired cron: jarvis-ops/configs/cron/*.yaml
+summary:      jarvis-ops/runtime-snapshots/cron-summary.md</code></pre>
+<ul>
+  <li>查看 live job：<code>hermes cron list</code></li>
+  <li>维护 desired job：Git 管 YAML 模板，记录 schedule、deliver、skills、prompt、toolsets。</li>
+  <li>变更方式：通过 <code>hermes cron create/edit</code> 或 Hermes cronjob tool 修改 live job。</li>
+  <li>变更后导出摘要：把 job_id、name、schedule、deliver、enabled、prompt 摘要写入 repo，便于审计。</li>
+</ul>
+
+<h1>9. 推荐落地阶段</h1>
+<ol>
+  <li seq="auto"><b>P0：单 Runtime Hub + 单 Worker</b>：Mac mini 本机同时做 Hub 和 Worker，跑通 Job Spec、lease、artifact、结果回写。</li>
+  <li seq="auto"><b>P1：多 Worker pull 模式</b>：增加 Mac Studio / MacBook Worker，按 capability 匹配任务，验证断线重试和 lease 回收。</li>
+  <li seq="auto"><b>P2：Artifact Store 标准化</b>：统一日志、截图、文件、trace schema，并在 Kanban card 展示 artifact refs。</li>
+  <li seq="auto"><b>P3：策略治理</b>：加入 worker allowlist、风险动作确认、资源配额、并发限制、任务优先级。</li>
+  <li seq="auto"><b>P4：可观测性和运维</b>：Dashboard 展示队列深度、worker 健康、失败原因、重试次数、平均完成时间。</li>
+</ol>
+
+<h1>10. 需要避免的坑</h1>
+<table>
+  <thead><tr><th background-color="light-gray">风险</th><th background-color="light-gray">后果</th><th background-color="light-gray">建议</th></tr></thead>
+  <tbody>
+    <tr><td>Central Hermes 和 Runtime Hub 都写状态</td><td>出现双主冲突，Kanban 不可信</td><td>Central Hermes 写 canonical；Hub 只写 runtime state</td></tr>
+    <tr><td>Worker 直接被公网调用</td><td>攻击面变大，权限难控</td><td>Worker 只 pull / long-poll，出站连接</td></tr>
+    <tr><td>只保存最终摘要</td><td>失败不可复盘，完成不可验收</td><td>Artifact Store 保存完整日志和证据</td></tr>
+    <tr><td>重试没有幂等键</td><td>重复发消息、重复写文档、重复下单</td><td>Job Spec 必须包含 idempotency_key 和风险等级</td></tr>
+    <tr><td>把 live cron 直接 Git 管</td><td>本地状态和 repo 配置互相覆盖</td><td>live/desired 分离，改完导出摘要</td></tr>
+  </tbody>
+</table>
+
+<h1>11. 建议的最小 MVP</h1>
+<checkbox done="false">定义 Job Spec v0：job_id、kanban_card_id、capabilities、lease_ttl、max_attempts、prompt、acceptance、artifact_policy。</checkbox>
+<checkbox done="false">在 Mac mini 上实现 Runtime Hub API：submit、poll、heartbeat、complete、fail、artifact_ref。</checkbox>
+<checkbox done="false">实现 Worker daemon：注册 capability、long-poll、执行任务、续租、上传 artifact、回报结果。</checkbox>
+<checkbox done="false">打通 Central Hermes 回写 Kanban：completed / failed / needs_boss_decision 三种结果。</checkbox>
+<checkbox done="false">实现 Dashboard 只读视图：队列、运行中、失败、Worker 心跳、artifact 链接。</checkbox>
+
+<callout emoji="🏁" background-color="light-green" border-color="green">
+  <p><b>结论</b>：这套设计的关键不是“多几台 Mac 跑任务”，而是把 Brain、Runtime、Worker、Artifact、Kanban 的状态边界切清楚。Central Hermes 保持唯一大脑和最终事实源；Mac mini Runtime Hub 负责可靠执行；Worker 只做可审计的任务执行器。</p>
+</callout>

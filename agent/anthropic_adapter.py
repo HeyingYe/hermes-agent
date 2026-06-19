@@ -896,7 +896,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -928,12 +928,6 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
-    # Try macOS Keychain first (covers Claude Code >=2.1.114)
-    kc_creds = _read_claude_code_credentials_from_keychain()
-    if kc_creds:
-        return kc_creds
-
-    # Fall back to JSON file
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if cred_path.exists():
         try:
@@ -950,6 +944,13 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
                     }
         except (json.JSONDecodeError, OSError, IOError) as e:
             logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+
+    # Try macOS Keychain after the explicit file path. Tests and custom HOME
+    # sandboxes should not be shadowed by the developer machine's real Claude
+    # Code keychain entry.
+    kc_creds = _read_claude_code_credentials_from_keychain()
+    if kc_creds:
+        return kc_creds
 
     return None
 
@@ -996,7 +997,7 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
     token_endpoints = [
         "https://platform.claude.com/v1/oauth/token",
-        "https://console.anthropic.com/v1/oauth/token",
+        "https://api.anthropic.com/v1/oauth/token",
     ]
     last_error = None
     for endpoint in token_endpoints:
@@ -1251,7 +1252,7 @@ def run_oauth_setup_token() -> Optional[str]:
 # Stores credentials in ~/.hermes/.anthropic_oauth.json (our own file).
 
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 _OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 _HERMES_OAUTH_FILE = get_hermes_home() / ".anthropic_oauth.json"

@@ -7318,11 +7318,18 @@ def _codex_device_code_login() -> Dict[str, Any]:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while _time.monotonic() - start < max_wait:
                 _time.sleep(poll_interval)
-                poll_resp = client.post(
-                    f"{issuer}/api/accounts/deviceauth/token",
-                    json={"device_auth_id": device_auth_id, "user_code": user_code},
-                    headers={"Content-Type": "application/json"},
-                )
+                try:
+                    poll_resp = client.post(
+                        f"{issuer}/api/accounts/deviceauth/token",
+                        json={"device_auth_id": device_auth_id, "user_code": user_code},
+                        headers={"Content-Type": "application/json"},
+                    )
+                except httpx.TransportError as exc:
+                    # A single poll hitting a read/connect timeout must not abort
+                    # the whole login — the device-auth long-poll occasionally
+                    # stalls past the 15s timeout. Keep waiting instead.
+                    logger.debug("Codex device-auth poll transient error, retrying: %s", exc)
+                    continue
 
                 if poll_resp.status_code == 200:
                     code_resp = poll_resp.json()
