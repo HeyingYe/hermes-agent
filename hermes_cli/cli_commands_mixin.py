@@ -1039,6 +1039,18 @@ class CLICommandsMixin:
             print("  Usage: /personality <name>")
             print()
 
+    def _handle_jarvis_command(self, cmd: str):
+        """Handle /jarvis local MVP utilities without external side effects."""
+        import shlex
+        from hermes_cli.jarvis import main as jarvis_main
+
+        try:
+            argv = shlex.split(cmd)[1:]
+        except ValueError as exc:
+            print(f"(._.) Could not parse /jarvis command: {exc}")
+            return
+        jarvis_main(argv)
+
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
         from cli import get_job

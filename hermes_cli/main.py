@@ -300,6 +300,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.jarvis import register_parser as register_jarvis_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -11082,7 +11083,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
+        "gui", "desktop", "jarvis", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -11800,6 +11801,11 @@ def main():
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
+
+    # =========================================================================
+    # jarvis command — local-verifiable assistant MVP utilities
+    # =========================================================================
+    register_jarvis_parser(subparsers)
 
     # =========================================================================
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
