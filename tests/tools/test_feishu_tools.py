@@ -1,13 +1,32 @@
-"""Tests for feishu_doc_tool and feishu_drive_tool — registration and schema validation."""
-
 import importlib
+import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.registry import registry
 
 # Trigger tool discovery so feishu tools get registered
+feishu_drive_tool = importlib.import_module("tools.feishu_drive_tool")
 importlib.import_module("tools.feishu_doc_tool")
-importlib.import_module("tools.feishu_drive_tool")
+
+
+class _FakeResponse:
+    def __init__(self, code=0, msg="ok", data=None):
+        self.code = code
+        self.msg = msg
+        payload = {"data": data or {}}
+        self.raw = SimpleNamespace(content=json.dumps(payload).encode())
+
+
+class _FakeClient:
+    def __init__(self, response=None):
+        self.response = response or _FakeResponse(data={"reply_id": "r1"})
+        self.requests = []
+
+    def request(self, request):
+        self.requests.append(request)
+        return self.response
 
 
 class TestFeishuToolRegistration(unittest.TestCase):
@@ -56,6 +75,55 @@ class TestFeishuToolRegistration(unittest.TestCase):
             props = entry.schema["parameters"].get("properties", {})
             self.assertIn("file_token", props, f"{tool_name} missing file_token param")
             self.assertIn("file_type", props, f"{tool_name} missing file_type param")
+
+    def test_reply_comment_builds_native_reply_request(self):
+        fake_client = _FakeClient()
+        feishu_drive_tool.set_client(fake_client)
+        try:
+            with patch.object(feishu_drive_tool, "_do_request", wraps=feishu_drive_tool._do_request) as wrapped:
+                result = feishu_drive_tool._handle_reply_comment({
+                    "file_token": "doc_token",
+                    "comment_id": "comment_1",
+                    "content": "收到 <OK> & 继续",
+                    "file_type": "docx",
+                })
+        finally:
+            feishu_drive_tool.set_client(None)
+
+        payload = json.loads(result)
+        self.assertEqual(payload["reply_id"], "r1")
+        wrapped.assert_called_once()
+        _client, method, uri = wrapped.call_args.args[:3]
+        kwargs = wrapped.call_args.kwargs
+        self.assertEqual(method, "POST")
+        self.assertEqual(uri, "/open-apis/drive/v1/files/:file_token/comments/:comment_id/replies")
+        self.assertEqual(kwargs["paths"], {"file_token": "doc_token", "comment_id": "comment_1"})
+        self.assertIn(("file_type", "docx"), kwargs["queries"])
+        self.assertEqual(
+            kwargs["body"],
+            {
+                "content": {
+                    "elements": [
+                        {"type": "text_run", "text_run": {"text": "收到 &lt;OK&gt; &amp; 继续"}},
+                    ]
+                }
+            },
+        )
+
+    def test_reply_comment_reports_feishu_error_code_for_fallback(self):
+        fake_client = _FakeClient(response=_FakeResponse(code=1069302, msg="whole comment cannot reply"))
+        feishu_drive_tool.set_client(fake_client)
+        try:
+            result = feishu_drive_tool._handle_reply_comment({
+                "file_token": "doc_token",
+                "comment_id": "comment_1",
+                "content": "回复",
+            })
+        finally:
+            feishu_drive_tool.set_client(None)
+
+        payload = json.loads(result)
+        self.assertIn("1069302", payload["error"])
 
 
 if __name__ == "__main__":

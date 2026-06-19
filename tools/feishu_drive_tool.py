@@ -277,6 +277,11 @@ FEISHU_DRIVE_REPLY_SCHEMA = {
 }
 
 
+def _sanitize_comment_text(text: str) -> str:
+    """Escape characters that Feishu comment text elements reject or reinterpret."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _handle_reply_comment(args: dict, **kwargs) -> str:
     client = get_client()
     if client is None:
@@ -284,7 +289,7 @@ def _handle_reply_comment(args: dict, **kwargs) -> str:
 
     file_token = args.get("file_token", "").strip()
     comment_id = args.get("comment_id", "").strip()
-    content = args.get("content", "").strip()
+    content = _sanitize_comment_text(args.get("content", "").strip())
     if not file_token or not comment_id or not content:
         return tool_error("file_token, comment_id, and content are required")
 
