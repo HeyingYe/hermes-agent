@@ -118,7 +118,7 @@ def infer_profile_and_route(message: str) -> RoutedTask:
         ("engineering", ("bug", "code", "test", "deploy", "api", "repo", "debug", "实现", "代码", "测试", "修复"), "Treat this as an engineering task; inspect the codebase before changing anything."),
         ("executive_brief", ("summarize", "summary", "brief", "ppt", "pdf", "doc", "deck", "总结", "摘要", "汇报"), "Produce an executive summary with decisions, risks, and next actions."),
         ("schedule_focus", ("today", "tomorrow", "calendar", "meeting", "deadline", "remind", "今天", "明天", "会议", "日程"), "Turn this into a focus plan with explicit time/date assumptions."),
-        ("external_action", ("send", "email", "post", "publish", "invite", "delete", "share", "发送", "发布", "删除", "邀请", "外发"), "Do not execute external side effects without explicit confirmation."),
+        ("external_action", ("send", "email", "post", "publish", "invite", "delete", "share", "发送", "发给", "转发", "分享", "发布", "删除", "邀请", "外发"), "Do not execute external side effects without explicit confirmation."),
     ]
 
     lowered = text.lower()

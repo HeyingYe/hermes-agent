@@ -106,3 +106,11 @@ def test_route_cli_json_output_is_structured():
     payload = json.loads(out.getvalue())
     assert payload["kind"] in {"product_strategy", "engineering"}
     assert payload["safety"] == "local-dry-run-safe"
+
+
+def test_chinese_external_send_phrase_requires_confirmation():
+    routed = infer_profile_and_route("帮我总结这个PPT并发给团队")
+
+    assert routed.kind == "executive_brief"
+    assert routed.safety == "requires-confirmation"
+    assert any(signal.label == "external_action" for signal in routed.profile_signals)
