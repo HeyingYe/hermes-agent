@@ -160,6 +160,24 @@ def _parse_string_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, str
     return result
 
 
+def _parse_float_map(host_obj: dict, root_obj: dict, key: str) -> dict[str, float]:
+    """Parse a string-to-float map with host-level whole-map override."""
+    source = host_obj[key] if key in host_obj else root_obj.get(key)
+    if not isinstance(source, dict):
+        return {}
+
+    result: dict[str, float] = {}
+    for raw_key, raw_value in source.items():
+        map_key = str(raw_key).strip()
+        try:
+            map_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if map_key and map_value > 0:
+            result[map_key] = map_value
+    return result
+
+
 def _parse_optional_string(
     host_obj: dict, root_obj: dict, key: str, default: str = ""
 ) -> str:
@@ -324,6 +342,11 @@ class HonchoClientConfig:
     write_frequency: str | int = "async"
     # Prefetch budget (None = no cap; set to an integer to bound auto-injected context)
     context_tokens: int | None = None
+    # Optional ranked context packing. Disabled by default for compatibility;
+    # when enabled, contextTokens remains the global cap and layerBudgets can
+    # tune stable/task/constraints/dialectic shares.
+    packing_enabled: bool = False
+    packing_layer_budgets: dict[str, float] = field(default_factory=dict)
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
@@ -490,6 +513,17 @@ class HonchoClientConfig:
         host_save = host_block.get("saveMessages")
         save_messages = host_save if host_save is not None else raw.get("saveMessages", True)
 
+        # Optional ranked packing config. Host-level contextPacking replaces
+        # root-level contextPacking as a whole; disabled by default so existing
+        # deployments keep legacy tail truncation unless they opt in.
+        packing_obj = (
+            host_block["contextPacking"]
+            if "contextPacking" in host_block
+            else raw.get("contextPacking")
+        )
+        if not isinstance(packing_obj, dict):
+            packing_obj = {}
+
         # sessionStrategy / sessionPeerPrefix: host first, root fallback
         session_strategy = (
             host_block.get("sessionStrategy")
@@ -539,6 +573,12 @@ class HonchoClientConfig:
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),
                 raw.get("contextTokens"),
+            ),
+            packing_enabled=bool(packing_obj.get("enabled", False)),
+            packing_layer_budgets=_parse_float_map(
+                packing_obj,
+                {},
+                "layerBudgets",
             ),
             dialectic_reasoning_level=(
                 host_block.get("dialecticReasoningLevel")

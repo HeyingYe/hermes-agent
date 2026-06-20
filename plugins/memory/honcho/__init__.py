@@ -650,8 +650,6 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._is_trivial_prompt(query):
             return ""
 
-        parts = []
-
         # ----- Layer 1: Base context (representation + card) -----
         # First fetch is asynchronous: a slow Honcho backend must not block the
         # first response. Serve empty context now and consume the background
@@ -676,8 +674,9 @@ class HonchoMemoryProvider(MemoryProvider):
                         self._base_context_cache = formatted
                     base_context = formatted
 
-        if base_context:
-            parts.append(base_context)
+        # Keep base_context separate from dialectic_result so the optional
+        # ranked packer can allocate layer budgets before the legacy global cap
+        # is enforced.
 
         # ----- Layer 2: Dialectic supplement -----
         # On the very first turn, no queue_prefetch() has run yet so the
@@ -751,18 +750,41 @@ class HonchoMemoryProvider(MemoryProvider):
             )
             dialectic_result = ""
 
-        if dialectic_result and dialectic_result.strip():
-            parts.append(dialectic_result)
+        result = self._pack_or_truncate_context(
+            base_context=base_context,
+            dialectic_result=dialectic_result,
+            query=query,
+        )
 
+        return result
+
+    def _pack_or_truncate_context(
+        self,
+        *,
+        base_context: str = "",
+        dialectic_result: str = "",
+        query: str = "",
+    ) -> str:
+        """Apply optional ranked packing, otherwise legacy tail truncation."""
+        parts = [part for part in (base_context, dialectic_result) if part and part.strip()]
         if not parts:
             return ""
 
         result = "\n\n".join(parts)
+        if not self._config or not getattr(self._config, "packing_enabled", False):
+            return self._truncate_to_budget(result)
 
-        # ----- Port #3265: token budget enforcement -----
-        result = self._truncate_to_budget(result)
-
-        return result
+        try:
+            from plugins.memory.honcho.packing import build_items_from_sections, pack_memory_context
+            items = build_items_from_sections(
+                base_context=base_context,
+                dialectic_result=dialectic_result,
+            )
+            packed = pack_memory_context(items, query=query, config=self._config)
+            return packed or self._truncate_to_budget(result)
+        except Exception as e:
+            logger.debug("Honcho ranked context packing failed; using legacy truncation: %s", e)
+            return self._truncate_to_budget(result)
 
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""

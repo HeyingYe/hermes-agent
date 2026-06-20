@@ -44,7 +44,12 @@ Two independent layers, each on its own cadence:
 **Layer 2 — Dialectic supplement** (fired every `dialecticCadence` turns):
 Multi-pass `.chat()` reasoning about the user, appended after base context.
 
-Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe).
+Both layers are joined, then either:
+
+- passed through the legacy `_truncate_to_budget` path (default, backward compatible), or
+- when `contextPacking.enabled` is explicitly set, ranked/deduplicated by layer before the same `contextTokens` character-estimate cap is enforced.
+
+Ranked packing scores candidate sections by query relevance, importance/card strength, recency (only when relevant), safety/permission terms, and near-duplicate overlap. It keeps separate layer budgets for stable peer facts, task-relevant context, operational constraints, and dialectic supplement so verbose recent observations do not crowd out stable preferences or safety constraints.
 
 ### Cold Start vs Warm Session Prompts
 
@@ -260,7 +265,9 @@ Host key is derived from the active Hermes profile: `hermes` (default) or `herme
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `contextTokens` | int | SDK default | Token budget for `context()` API calls. Also gates prefetch truncation (tokens × 4 chars) |
+| `contextTokens` | int | SDK default | Token budget for `context()` API calls. Also gates prefetch truncation/packing (tokens × 4 chars) |
+| `contextPacking.enabled` | bool | `false` | Opt-in ranked packing and cross-layer dedup before enforcing `contextTokens`. Disabled by default so existing configs keep legacy tail truncation |
+| `contextPacking.layerBudgets` | object | `{stable: 0.30, task: 0.30, constraints: 0.25, dialectic: 0.15}` | Optional shares for ranked packing buckets. Values are normalized if supplied |
 | `messageMaxChars` | int | `25000` | Max chars per message sent via `add_messages()`. Exceeding this triggers chunking with `[continued]` markers. Honcho cloud limit: 25k |
 
 ### Cadence (Cost Control)
