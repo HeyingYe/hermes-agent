@@ -637,6 +637,10 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # P5.1: reset the per-session token circuit breaker alongside the other
+        # session-scoped counters (see agent/token_budget.py).
+        if getattr(self, "token_budget", None) is not None:
+            self.token_budget.reset_session()
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"

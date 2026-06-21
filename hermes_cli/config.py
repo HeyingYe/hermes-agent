@@ -888,6 +888,17 @@ DEFAULT_CONFIG = {
     "max_concurrent_sessions": None,
     "agent": {
         "max_turns": 90,
+        # P5.1 token circuit breaker: cap total context tokens SENT
+        # (prompt_tokens = input + cached input) to halt runaway loops that
+        # re-send a huge context on every iteration — a failure mode the
+        # iteration-count cap (max_turns) misses. Measured on prompt_tokens
+        # because such loops are dominated by cache_read; uncached input stays
+        # tiny. 0 = unlimited for that scope; enabled=false disables the breaker.
+        "token_budget": {
+            "enabled": True,
+            "per_turn_prompt_tokens": 3000000,
+            "per_session_prompt_tokens": 8000000,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
