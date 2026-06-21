@@ -1977,6 +1977,22 @@ DEFAULT_CONFIG = {
         "acp_persistent_process": False,
         "acp_pool_size": 5,
         "acp_idle_timeout_seconds": 120,
+        # T2b: bind a persistent ACP session to each Hermes conversation (keyed by
+        # a fingerprint of its opening) and send only the incremental non-assistant
+        # turns, so Claude's prefix cache covers the conversation history. Diverges
+        # safely to a fresh full-history session on compression/edits. Default OFF
+        # → fresh session per call (unchanged). Implies/needs acp_persistent_process.
+        "acp_persistent_session": False,
+        # Pass _meta.disableBuiltInTools to the ACP adapter: Hermes drives tools via
+        # <tool_call> text, so the engine's own built-in tools only bloat its system
+        # prefix (~25.7k→12.1k measured) and could let it touch the filesystem outside
+        # Hermes's external_action confirmation. Default OFF → unchanged.
+        # ⚠️ MUTUALLY EXCLUSIVE WITH acp_persistent_session: disabling built-in tools
+        # removes the tools+system block that Anthropic prompt caching anchors on, so
+        # it drops T2b's cache-hit from ~100% to 0% (measured). Do NOT enable both —
+        # prefer acp_persistent_session (the big win); it makes the prefix cache-read
+        # (free) anyway, so the prefix-shrink benefit is moot.
+        "acp_disable_builtin_tools": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
