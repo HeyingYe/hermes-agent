@@ -1965,6 +1965,18 @@ DEFAULT_CONFIG = {
         "sonnet_model": "claude-sonnet-4-6",
         "opus_model": "claude-opus-4-8",
         "opus_complexity_min": 4,
+        # T2a (perf): reuse a warm pool of ACP subprocesses instead of spawning
+        # one per API call (~10-14s cold start each). Default OFF → byte-identical
+        # per-call spawn (Copilot path unaffected). Roll back with
+        # acp_persistent_process:false. pool_size bounds concurrent warm procs
+        # (delegation can run several children); idle ones are reaped after
+        # acp_idle_timeout_seconds. Sessions are still created per call
+        # (fresh session/new) so model output is unchanged — this only removes
+        # the spawn+initialize cold start, not the cache economics (that needs
+        # session reuse, deferred to T2b).
+        "acp_persistent_process": False,
+        "acp_pool_size": 5,
+        "acp_idle_timeout_seconds": 120,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

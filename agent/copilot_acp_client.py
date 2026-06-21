@@ -8,6 +8,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -354,6 +355,198 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     return resolved
 
 
+def _acp_persistence_settings() -> tuple[bool, int, float]:
+    """``(persistent, pool_size, idle_timeout_seconds)`` from config (T2a).
+
+    Read from ``route_decision.{acp_persistent_process,acp_pool_size,
+    acp_idle_timeout_seconds}`` via the runtime-safe ``load_config_readonly``
+    (the same loader the gateway loop uses for ``token_budget`` — see
+    SELF_ARCHITECTURE §7 on the 3-loader gotcha). Defaults ``(False, 5, 120)``:
+    when disabled the client spawns a throwaway process per call exactly as
+    before (Copilot path unchanged). ``load_config_readonly`` is mtime-cached,
+    so calling this per prompt is cheap.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        rd = (load_config_readonly() or {}).get("route_decision", {}) or {}
+        persistent = bool(rd.get("acp_persistent_process", False))
+        pool_size = int(rd.get("acp_pool_size", 5) or 5)
+        idle = float(rd.get("acp_idle_timeout_seconds", 120) or 120)
+        return persistent, max(1, pool_size), max(1.0, idle)
+    except Exception:
+        return False, 5, 120.0
+
+
+class _AcpConnection:
+    """One ACP subprocess + its stdio reader threads and JSON-RPC inbox.
+
+    Owns the transport for an external ACP CLI (Copilot or claude-code-acp).
+    When persistence is enabled it is reused across prompts (kept warm in the
+    pool); otherwise it is created throwaway for a single prompt. NOT safe for
+    concurrent prompts — the owner serializes via ``lock``. ``initialized``
+    tracks the once-per-connection ACP ``initialize`` handshake so reuse skips
+    the cold start.
+    """
+
+    def __init__(self, command: str, args: list[str], cwd: str) -> None:
+        self.command = command
+        self.args = list(args)
+        self.cwd = cwd
+        self.proc: subprocess.Popen[str] | None = None
+        self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self.stderr_tail: deque[str] = deque(maxlen=40)
+        self.next_id = 0
+        self.initialized = False
+        self.last_used = 0.0
+        self.lock = threading.Lock()
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                [self.command] + self.args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                cwd=self.cwd,
+                env=_build_subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Could not start Copilot ACP command '{self.command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            ) from exc
+
+        if proc.stdin is None or proc.stdout is None:
+            proc.kill()
+            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
+
+        self.proc = proc
+
+        def _stdout_reader() -> None:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                try:
+                    self.inbox.put(json.loads(line))
+                except Exception:
+                    self.inbox.put({"raw": line.rstrip("\n")})
+
+        def _stderr_reader() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                self.stderr_tail.append(line.rstrip("\n"))
+
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+        threading.Thread(target=_stderr_reader, daemon=True).start()
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        self.initialized = False
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+class _AcpPool:
+    """Module-level pool of warm :class:`_AcpConnection`\\ s, keyed by
+    ``(command, args, cwd)`` (T2a).
+
+    Persistence must live here, NOT on the client instance: the live API call
+    runs on a fresh per-request ``shared=False`` client that the loop closes
+    after every call, so a connection cached on the client would be re-spawned
+    each turn. Reaping is lazy (on acquire/release; no background thread) +
+    ``atexit`` so we never leak node/Claude child processes.
+    """
+
+    def __init__(self) -> None:
+        self._idle: dict[tuple, list[_AcpConnection]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(command: str, args: list[str], cwd: str) -> tuple:
+        return (command, tuple(args), cwd)
+
+    def acquire(self, command: str, args: list[str], cwd: str, idle_timeout: float) -> _AcpConnection:
+        """Return a warm connection (reused if alive and within the idle
+        window), else a freshly started one. Dead/stale idle conns are reaped."""
+        key = self._key(command, args, cwd)
+        now = time.monotonic()
+        chosen: _AcpConnection | None = None
+        with self._lock:
+            bucket = self._idle.get(key) or []
+            survivors: list[_AcpConnection] = []
+            for conn in bucket:
+                if conn.alive() and (now - conn.last_used) <= idle_timeout:
+                    if chosen is None:
+                        chosen = conn  # take the first reusable; leave the rest warm
+                    else:
+                        survivors.append(conn)
+                else:
+                    conn.close()  # dead or idle-expired → reap
+            self._idle[key] = survivors
+        if chosen is not None:
+            return chosen
+        conn = _AcpConnection(command, args, cwd)
+        conn.start()
+        return conn
+
+    def release(
+        self,
+        command: str,
+        args: list[str],
+        cwd: str,
+        conn: _AcpConnection,
+        *,
+        pool_size: int,
+        idle_timeout: float,
+    ) -> None:
+        """Return a connection to the pool (kept warm) if alive and there's
+        room; otherwise close it. Also lazily reaps dead/idle-expired peers."""
+        key = self._key(command, args, cwd)
+        now = time.monotonic()
+        conn.last_used = now
+        with self._lock:
+            bucket = self._idle.get(key) or []
+            survivors = [
+                c for c in bucket
+                if c.alive() and (now - c.last_used) <= idle_timeout
+            ]
+            for c in bucket:
+                if c not in survivors:
+                    c.close()
+            if conn.alive() and len(survivors) < pool_size:
+                survivors.append(conn)
+            else:
+                conn.close()  # pool full or conn dead → discard
+            self._idle[key] = survivors
+
+    def close_all(self) -> None:
+        with self._lock:
+            for bucket in self._idle.values():
+                for conn in bucket:
+                    conn.close()
+            self._idle.clear()
+
+
+_POOL = _AcpPool()
+atexit.register(_POOL.close_all)
+
+
 class _ACPChatCompletions:
     def __init__(self, client: "CopilotACPClient"):
         self._client = client
@@ -478,118 +671,76 @@ class CopilotACPClient:
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
-        try:
-            proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Could not start Copilot ACP command '{self._acp_command}'. "
-                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
-            ) from exc
+        persistent, pool_size, idle_timeout = _acp_persistence_settings()
 
-        if proc.stdin is None or proc.stdout is None:
-            proc.kill()
-            raise RuntimeError("Copilot ACP process did not expose stdin/stdout pipes.")
-
-        self.is_closed = False
-        with self._active_process_lock:
-            self._active_process = proc
-
-        inbox: queue.Queue[dict[str, Any]] = queue.Queue()
-        stderr_tail: deque[str] = deque(maxlen=40)
-
-        def _stdout_reader() -> None:
-            if proc.stdout is None:
-                return
-            for line in proc.stdout:
+        if persistent:
+            # T2a: borrow a warm process from the pool, run the prompt, return
+            # it warm. The pool owns the lifecycle, so the per-request client's
+            # post-call close() must NOT kill it — we expose the process via
+            # _active_process only for the duration of the prompt (so an
+            # interrupt can still abort), then clear it.
+            conn = _POOL.acquire(self._acp_command, self._acp_args, self._acp_cwd, idle_timeout)
+            with conn.lock:
+                with self._active_process_lock:
+                    self._active_process = conn.proc
+                    self.is_closed = False
                 try:
-                    inbox.put(json.loads(line))
+                    result = self._run_on_connection(conn, prompt_text, timeout_seconds, model)
                 except Exception:
-                    inbox.put({"raw": line.rstrip("\n")})
+                    conn.close()  # poison a broken connection — never re-pool it
+                    raise
+                finally:
+                    with self._active_process_lock:
+                        self._active_process = None
+            _POOL.release(
+                self._acp_command, self._acp_args, self._acp_cwd, conn,
+                pool_size=pool_size, idle_timeout=idle_timeout,
+            )
+            return result
 
-        def _stderr_reader() -> None:
-            if proc.stderr is None:
-                return
-            for line in proc.stderr:
-                stderr_tail.append(line.rstrip("\n"))
-
-        out_thread = threading.Thread(target=_stdout_reader, daemon=True)
-        err_thread = threading.Thread(target=_stderr_reader, daemon=True)
-        out_thread.start()
-        err_thread.start()
-
-        next_id = 0
-
-        def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
-            nonlocal next_id
-            next_id += 1
-            request_id = next_id
-            payload = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }
-            proc.stdin.write(json.dumps(payload) + "\n")
-            proc.stdin.flush()
-
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                try:
-                    msg = inbox.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                if self._handle_server_message(
-                    msg,
-                    process=proc,
-                    cwd=self._acp_cwd,
-                    text_parts=text_parts,
-                    reasoning_parts=reasoning_parts,
-                ):
-                    continue
-
-                if msg.get("id") != request_id:
-                    continue
-                if "error" in msg:
-                    err = msg.get("error") or {}
-                    raise RuntimeError(
-                        f"Copilot ACP {method} failed: {err.get('message') or err}"
-                    )
-                return msg.get("result")
-
-            stderr_text = "\n".join(stderr_tail).strip()
-            if proc.poll() is not None and stderr_text:
-                if _is_gh_copilot_deprecation_message(stderr_text):
-                    raise RuntimeError(
-                        "Hermes ACP mode requires the NEW GitHub Copilot CLI "
-                        "(github.com/github/copilot-cli), but the binary it just "
-                        "spawned is the deprecated `gh copilot` extension.\n\n"
-                        "Install the new CLI:\n"
-                        "  npm install -g @github/copilot\n"
-                        "  # then verify with: copilot --help\n\n"
-                        "If `copilot` already resolves to the new CLI but you still see this,\n"
-                        "point Hermes at it explicitly:\n"
-                        "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
-                        "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
-                        "directly with a Copilot subscription token) via `hermes setup`.\n\n"
-                        f"Original error:\n{stderr_text}"
-                    )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
-
+        # Default (persistence off): one throwaway process per call —
+        # behaviorally identical to the original per-call spawn.
+        conn = _AcpConnection(self._acp_command, self._acp_args, self._acp_cwd)
         try:
-            _request(
+            conn.start()
+            with self._active_process_lock:
+                self._active_process = conn.proc
+                self.is_closed = False
+            return self._run_on_connection(conn, prompt_text, timeout_seconds, model)
+        finally:
+            conn.close()
+            with self._active_process_lock:
+                self._active_process = None
+            self.is_closed = True
+
+    def _run_on_connection(
+        self,
+        conn: "_AcpConnection",
+        prompt_text: str,
+        timeout_seconds: float,
+        model: str | None,
+    ) -> tuple[str, str]:
+        """Run one ACP prompt cycle on ``conn``: initialize (once per
+        connection), open a fresh session, bind the model, send the prompt,
+        collect text. A fresh ``session/new`` per call keeps output identical
+        to the per-call-spawn path — only the spawn + ``initialize`` cold start
+        is amortized when the connection is reused."""
+        if conn.proc is None:
+            conn.start()
+            with self._active_process_lock:
+                self._active_process = conn.proc
+
+        # Drain any trailing messages from a prior prompt on a reused
+        # connection so late notifications can't bleed into this prompt.
+        while True:
+            try:
+                conn.inbox.get_nowait()
+            except queue.Empty:
+                break
+
+        if not conn.initialized:
+            self._acp_request(
+                conn,
                 "initialize",
                 {
                     "protocolVersion": 1,
@@ -605,57 +756,138 @@ class CopilotACPClient:
                         "version": "0.0.0",
                     },
                 },
+                timeout_seconds=timeout_seconds,
             )
-            session = _request(
-                "session/new",
-                {
-                    "cwd": self._acp_cwd,
-                    "mcpServers": [],
-                },
-            ) or {}
-            session_id = str(session.get("sessionId") or "").strip()
-            if not session_id:
-                raise RuntimeError("Copilot ACP did not return a sessionId.")
+            conn.initialized = True
 
-            # Bind the requested model on this session via ACP ``session/set_model``.
-            # The claude-code-acp adapter advertises availableModels/currentModelId
-            # under ``result.models``; Copilot ACP advertises none, so this is a
-            # no-op there. The model is fixed once at session start — never switched
-            # mid-session (cache-safe; no-touch #1).
-            if model:
-                try:
-                    _models = session.get("models") or {}
-                    _available = _models.get("availableModels") or []
-                    _current = str(_models.get("currentModelId") or "").strip()
-                    _target = _match_acp_model_id(model, _available)
-                    if _target and _target != _current:
-                        _request("session/set_model", {"sessionId": session_id, "modelId": _target})
-                        logger.info(
-                            "ACP session/set_model: %s -> %s (requested %r)",
-                            _current or "?", _target, model,
-                        )
-                except Exception:
-                    logger.debug("ACP session/set_model skipped/failed", exc_info=True)
+        session = self._acp_request(
+            conn,
+            "session/new",
+            {
+                "cwd": conn.cwd,
+                "mcpServers": [],
+            },
+            timeout_seconds=timeout_seconds,
+        ) or {}
+        session_id = str(session.get("sessionId") or "").strip()
+        if not session_id:
+            raise RuntimeError("Copilot ACP did not return a sessionId.")
 
-            text_parts: list[str] = []
-            reasoning_parts: list[str] = []
-            _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": [
-                        {
-                            "type": "text",
-                            "text": prompt_text,
-                        }
-                    ],
-                },
+        # Bind the requested model on this session via ACP ``session/set_model``.
+        # The claude-code-acp adapter advertises availableModels/currentModelId
+        # under ``result.models``; Copilot ACP advertises none, so this is a
+        # no-op there. The model is fixed once at session start — never switched
+        # mid-session (cache-safe; no-touch #1).
+        if model:
+            try:
+                _models = session.get("models") or {}
+                _available = _models.get("availableModels") or []
+                _current = str(_models.get("currentModelId") or "").strip()
+                _target = _match_acp_model_id(model, _available)
+                if _target and _target != _current:
+                    self._acp_request(
+                        conn,
+                        "session/set_model",
+                        {"sessionId": session_id, "modelId": _target},
+                        timeout_seconds=timeout_seconds,
+                    )
+                    logger.info(
+                        "ACP session/set_model: %s -> %s (requested %r)",
+                        _current or "?", _target, model,
+                    )
+            except Exception:
+                logger.debug("ACP session/set_model skipped/failed", exc_info=True)
+
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        self._acp_request(
+            conn,
+            "session/prompt",
+            {
+                "sessionId": session_id,
+                "prompt": [
+                    {
+                        "type": "text",
+                        "text": prompt_text,
+                    }
+                ],
+            },
+            timeout_seconds=timeout_seconds,
+            text_parts=text_parts,
+            reasoning_parts=reasoning_parts,
+        )
+        return "".join(text_parts), "".join(reasoning_parts)
+
+    def _acp_request(
+        self,
+        conn: "_AcpConnection",
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float,
+        text_parts: list[str] | None = None,
+        reasoning_parts: list[str] | None = None,
+    ) -> Any:
+        proc = conn.proc
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("Copilot ACP process is not running.")
+        conn.next_id += 1
+        request_id = conn.next_id
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        proc.stdin.write(json.dumps(payload) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                msg = conn.inbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if self._handle_server_message(
+                msg,
+                process=proc,
+                cwd=conn.cwd,
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
-            )
-            return "".join(text_parts), "".join(reasoning_parts)
-        finally:
-            self.close()
+            ):
+                continue
+
+            if msg.get("id") != request_id:
+                continue
+            if "error" in msg:
+                err = msg.get("error") or {}
+                raise RuntimeError(
+                    f"Copilot ACP {method} failed: {err.get('message') or err}"
+                )
+            return msg.get("result")
+
+        stderr_text = "\n".join(conn.stderr_tail).strip()
+        if proc.poll() is not None and stderr_text:
+            if _is_gh_copilot_deprecation_message(stderr_text):
+                raise RuntimeError(
+                    "Hermes ACP mode requires the NEW GitHub Copilot CLI "
+                    "(github.com/github/copilot-cli), but the binary it just "
+                    "spawned is the deprecated `gh copilot` extension.\n\n"
+                    "Install the new CLI:\n"
+                    "  npm install -g @github/copilot\n"
+                    "  # then verify with: copilot --help\n\n"
+                    "If `copilot` already resolves to the new CLI but you still see this,\n"
+                    "point Hermes at it explicitly:\n"
+                    "  export HERMES_COPILOT_ACP_COMMAND=/path/to/new/copilot\n\n"
+                    "Alternative: use the `copilot` provider (no ACP, hits the Copilot API\n"
+                    "directly with a Copilot subscription token) via `hermes setup`.\n\n"
+                    f"Original error:\n{stderr_text}"
+                )
+            raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
+        raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
 
     def _handle_server_message(
         self,
