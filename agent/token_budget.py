@@ -37,14 +37,26 @@ class TokenBudget:
         per_turn_limit: int = 0,
         per_session_limit: int = 0,
         enabled: bool = True,
+        expensive_per_turn_limit: int = 0,
+        expensive_per_session_limit: int = 0,
+        expensive_models=None,
     ):
         # limit <= 0 => unlimited for that scope
         self.per_turn_limit = max(0, int(per_turn_limit or 0))
         self.per_session_limit = max(0, int(per_session_limit or 0))
+        # P5.4: tighter caps applied while the active model is "expensive"
+        # (e.g. Opus). 0 = no separate expensive cap for that scope.
+        self.expensive_per_turn_limit = max(0, int(expensive_per_turn_limit or 0))
+        self.expensive_per_session_limit = max(0, int(expensive_per_session_limit or 0))
+        self.expensive_models = frozenset(expensive_models or ())
         self.enabled = bool(enabled)
         self._turn_used = 0
         self._session_used = 0
         self._lock = threading.Lock()
+
+    def is_expensive(self, model) -> bool:
+        """True if ``model`` is in the configured expensive set (P5.4)."""
+        return bool(model) and model in self.expensive_models
 
     def add(self, prompt_tokens: int) -> None:
         """Record the context tokens sent on one API call (prompt_tokens)."""
@@ -75,14 +87,34 @@ class TokenBudget:
         with self._lock:
             return self._session_used
 
-    def breach(self) -> Optional[str]:
-        """Return ``"per_turn"`` / ``"per_session"`` if a cap is hit, else None."""
+    def breach(self, expensive: bool = False) -> Optional[str]:
+        """Return ``"per_turn"`` / ``"per_session"`` if a cap is hit, else None.
+
+        When ``expensive`` is True (the active model is in ``expensive_models``,
+        P5.4), the tighter expensive caps apply — the smaller of the normal and
+        expensive limit wins for each scope.
+        """
         if not self.enabled:
             return None
         with self._lock:
-            if self.per_turn_limit and self._turn_used >= self.per_turn_limit:
+            per_turn = self.per_turn_limit
+            per_session = self.per_session_limit
+            if expensive:
+                if self.expensive_per_turn_limit:
+                    per_turn = (
+                        self.expensive_per_turn_limit
+                        if per_turn == 0
+                        else min(per_turn, self.expensive_per_turn_limit)
+                    )
+                if self.expensive_per_session_limit:
+                    per_session = (
+                        self.expensive_per_session_limit
+                        if per_session == 0
+                        else min(per_session, self.expensive_per_session_limit)
+                    )
+            if per_turn and self._turn_used >= per_turn:
                 return "per_turn"
-            if self.per_session_limit and self._session_used >= self.per_session_limit:
+            if per_session and self._session_used >= per_session:
                 return "per_session"
         return None
 

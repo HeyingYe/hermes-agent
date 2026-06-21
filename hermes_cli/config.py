@@ -898,6 +898,18 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "per_turn_prompt_tokens": 3000000,
             "per_session_prompt_tokens": 8000000,
+            # P5.4 in-turn expensive-model (Opus) guard: while the ACTIVE model is
+            # in expensive_models, the smaller of the normal cap and these tighter
+            # caps applies — so an Opus grunt loop is cut sooner than a gpt-5.5 one.
+            # 0 = no separate expensive cap. (This is a tighter budget, NOT mid-turn
+            # model-switching, which stays an architectural change.)
+            "expensive_models": [
+                "claude-opus-4-8",
+                "claude-opus-4-6",
+                "claude-opus-4-5",
+            ],
+            "per_turn_prompt_tokens_expensive": 1500000,
+            "per_session_prompt_tokens_expensive": 4000000,
         },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling

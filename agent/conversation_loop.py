@@ -478,6 +478,7 @@ def _ensure_token_budget(agent):
     if tb is not None:
         return tb
     enabled, per_turn, per_session = True, 3_000_000, 8_000_000
+    exp_per_turn, exp_per_session, exp_models = 1_500_000, 4_000_000, ()
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -485,9 +486,20 @@ def _ensure_token_budget(agent):
         enabled = bool(cfg.get("enabled", enabled))
         per_turn = int(cfg.get("per_turn_prompt_tokens", per_turn) or 0)
         per_session = int(cfg.get("per_session_prompt_tokens", per_session) or 0)
+        # P5.4: tighter caps + model list for in-turn expensive-model (Opus) guard
+        exp_per_turn = int(cfg.get("per_turn_prompt_tokens_expensive", exp_per_turn) or 0)
+        exp_per_session = int(cfg.get("per_session_prompt_tokens_expensive", exp_per_session) or 0)
+        exp_models = tuple(cfg.get("expensive_models") or ())
     except Exception as _tb_err:  # pragma: no cover - defensive
         logger.debug("token_budget config load failed, using defaults: %s", _tb_err)
-    tb = TokenBudget(per_turn_limit=per_turn, per_session_limit=per_session, enabled=enabled)
+    tb = TokenBudget(
+        per_turn_limit=per_turn,
+        per_session_limit=per_session,
+        enabled=enabled,
+        expensive_per_turn_limit=exp_per_turn,
+        expensive_per_session_limit=exp_per_session,
+        expensive_models=exp_models,
+    )
     agent.token_budget = tb
     return tb
 
@@ -609,7 +621,9 @@ def run_conversation(
         # stop BEFORE sending another large context. prompt_tokens (input +
         # cached input) is the right signal — runaway loops are dominated by
         # cache_read, not uncached input. 0-limit scopes are skipped.
-        _tok_breach = agent.token_budget.breach() if getattr(agent, "token_budget", None) else None
+        _tb = getattr(agent, "token_budget", None)
+        # P5.4: while on an expensive model (Opus), the tighter expensive caps apply.
+        _tok_breach = _tb.breach(expensive=_tb.is_expensive(agent.model)) if _tb else None
         if _tok_breach:
             _turn_exit_reason = f"token_budget_exhausted:{_tok_breach}"
             if not agent.quiet_mode:
