@@ -548,6 +548,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
+-- P5.3: per-(session, model, provider) usage. The sessions table stores a single
+-- `model`/`billing_provider` (first-writer-wins via COALESCE), which mis-attributes
+-- mixed-model sessions (e.g. a session that ran 155 Opus + 13 gpt-5.5 calls shows
+-- as one model). This table keeps the true breakdown, additively.
+CREATE TABLE IF NOT EXISTS session_model_usage (
+    session_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, model, provider)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -1573,6 +1593,78 @@ class SessionDB:
                 (model, session_id),
             )
         self._execute_write(_do)
+
+    def record_model_usage(
+        self,
+        session_id: str,
+        model: str,
+        provider: str = "",
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        api_calls: int = 1,
+    ) -> None:
+        """P5.3: accumulate per-(session, model, provider) usage (UPSERT).
+
+        Unlike ``sessions.model`` (first-writer-wins), this keeps the true
+        per-model breakdown so mixed-model sessions are not mis-attributed.
+        """
+        if not session_id or not model:
+            return
+        provider = provider or ""
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO session_model_usage (
+                    session_id, model, provider, prompt_tokens, completion_tokens,
+                    total_tokens, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, api_calls
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, model, provider) DO UPDATE SET
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    input_tokens = input_tokens + excluded.input_tokens,
+                    output_tokens = output_tokens + excluded.output_tokens,
+                    cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+                    cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+                    reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+                    api_calls = api_calls + excluded.api_calls
+                """,
+                (
+                    session_id, model, provider, prompt_tokens, completion_tokens,
+                    total_tokens, input_tokens, output_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, api_calls,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_model_usage(self, session_id: str) -> list:
+        """P5.3: return per-model usage rows for a session, biggest first."""
+        if not session_id:
+            return []
+
+        def _do(conn):
+            cur = conn.execute(
+                "SELECT model, provider, prompt_tokens, completion_tokens, "
+                "total_tokens, input_tokens, output_tokens, cache_read_tokens, "
+                "cache_write_tokens, reasoning_tokens, api_calls "
+                "FROM session_model_usage WHERE session_id = ? "
+                "ORDER BY prompt_tokens DESC",
+                (session_id,),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        return self._execute_write(_do)
 
     def update_token_counts(
         self,

@@ -1944,6 +1944,23 @@ def run_conversation(
                                 model=agent.model,
                                 api_call_count=1,
                             )
+                            # P5.3: record the TRUE per-model breakdown so a
+                            # mixed-model session (e.g. mostly Opus + some
+                            # gpt-5.5) is not mis-attributed to sessions.model.
+                            agent._session_db.record_model_usage(
+                                agent.session_id,
+                                agent.model,
+                                agent.provider or "",
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                reasoning_tokens=canonical_usage.reasoning_tokens,
+                                api_calls=1,
+                            )
                         except Exception as e:
                             # Log token persistence failures so they're
                             # visible in agent.log — silent loss here is
