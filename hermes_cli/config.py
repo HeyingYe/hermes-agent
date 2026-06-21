@@ -1239,11 +1239,17 @@ DEFAULT_CONFIG = {
             "exact_failure": 2,
             "same_tool_failure": 3,
             "idempotent_no_progress": 2,
+            # P5.2: consecutive read-only (idempotent) calls with no writes/edits.
+            "readonly_streak": 30,
         },
         "hard_stop_after": {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+            # P5.2: halt a no-progress read-only exploration loop (only when
+            # hard_stop_enabled). Catches "many different read_file calls" loops
+            # that the per-signature idempotent_no_progress detector misses.
+            "readonly_streak": 60,
         },
     },
 
