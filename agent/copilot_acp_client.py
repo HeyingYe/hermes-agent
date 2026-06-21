@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -106,6 +107,52 @@ def _match_acp_model_id(requested: str, available: list[dict[str, Any]]) -> str 
     return None
 
 
+def _acp_usage_to_namespace(acp_usage: dict[str, Any] | None) -> SimpleNamespace:
+    """Map an ACP ``PromptResponse.usage`` object to the OpenAI chat-completions
+    usage shape that :func:`agent.usage_pricing.normalize_usage` understands.
+
+    The claude-agent-acp adapter (>=0.48) reports per-turn token usage on the
+    ``session/prompt`` result as
+    ``{inputTokens, outputTokens, cachedReadTokens, cachedWriteTokens, totalTokens}``
+    (Anthropic semantics: ``inputTokens`` EXCLUDES cache). The Copilot ACP server
+    and the older claude-code-acp adapter report none → ``acp_usage`` is ``None``
+    and we fall back to all-zero, exactly the prior behavior.
+
+    ``normalize_usage`` runs the chat_completions branch for this provider, so we
+    surface ``prompt_tokens`` as the FULL input (input + cache read + cache write)
+    and break the cache out under ``prompt_tokens_details`` — the cached_tokens =
+    cache reads, cache_write_tokens = cache creation. NOTE: the ``usage`` field is
+    marked UNSTABLE in the ACP schema, hence the defensive shape here.
+    """
+    if not isinstance(acp_usage, dict):
+        return SimpleNamespace(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+        )
+
+    def _i(key: str) -> int:
+        v = acp_usage.get(key)
+        return int(v) if isinstance(v, (int, float)) else 0
+
+    inp = _i("inputTokens")
+    out = _i("outputTokens")
+    cache_read = _i("cachedReadTokens")
+    cache_write = _i("cachedWriteTokens")
+    prompt_tokens = inp + cache_read + cache_write  # OpenAI: prompt includes cache
+    total = _i("totalTokens") or (prompt_tokens + out)
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=out,
+        total_tokens=total,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        ),
+    )
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -131,7 +178,7 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
+def _build_subprocess_env(command: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     home = _resolve_home_dir()
     env["HOME"] = home
@@ -143,6 +190,17 @@ def _build_subprocess_env() -> dict[str, str]:
     # runs inside a Claude Code session; harmless for Copilot.
     for _nest in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
         env.pop(_nest, None)
+    # The claude-agent-acp adapter (Agent SDK 0.3.x) bundles a per-arch `claude`
+    # binary and prefers it; under an x64-Rosetta node the bundled darwin-x64
+    # binary hangs. Pin the adapter to a known-good native `claude` via
+    # CLAUDE_CODE_EXECUTABLE (the SDK option the adapter honors:
+    # `pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? claudeCliPath()`).
+    # Only when unset (explicit override always wins) and only for claude
+    # adapters (Copilot ignores this var, but we scope it to be tidy).
+    if "CLAUDE_CODE_EXECUTABLE" not in env and (command is None or "claude" in os.path.basename(command).lower()):
+        _claude = os.getenv("HERMES_CLAUDE_CODE_EXECUTABLE", "").strip() or shutil.which("claude")
+        if _claude:
+            env["CLAUDE_CODE_EXECUTABLE"] = _claude
     return env
 
 
@@ -414,7 +472,7 @@ class _AcpConnection:
                 text=True,
                 bufsize=1,
                 cwd=self.cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(self.command),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -641,7 +699,7 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, acp_usage = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
             model=model,
@@ -649,12 +707,7 @@ class CopilotACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = _acp_usage_to_namespace(acp_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -670,7 +723,7 @@ class CopilotACPClient:
             model=model or "copilot-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str, dict[str, Any] | None]:
         persistent, pool_size, idle_timeout = _acp_persistence_settings()
 
         if persistent:
@@ -719,7 +772,7 @@ class CopilotACPClient:
         prompt_text: str,
         timeout_seconds: float,
         model: str | None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, dict[str, Any] | None]:
         """Run one ACP prompt cycle on ``conn``: initialize (once per
         connection), open a fresh session, bind the model, send the prompt,
         collect text. A fresh ``session/new`` per call keeps output identical
@@ -773,34 +826,13 @@ class CopilotACPClient:
         if not session_id:
             raise RuntimeError("Copilot ACP did not return a sessionId.")
 
-        # Bind the requested model on this session via ACP ``session/set_model``.
-        # The claude-code-acp adapter advertises availableModels/currentModelId
-        # under ``result.models``; Copilot ACP advertises none, so this is a
-        # no-op there. The model is fixed once at session start — never switched
-        # mid-session (cache-safe; no-touch #1).
-        if model:
-            try:
-                _models = session.get("models") or {}
-                _available = _models.get("availableModels") or []
-                _current = str(_models.get("currentModelId") or "").strip()
-                _target = _match_acp_model_id(model, _available)
-                if _target and _target != _current:
-                    self._acp_request(
-                        conn,
-                        "session/set_model",
-                        {"sessionId": session_id, "modelId": _target},
-                        timeout_seconds=timeout_seconds,
-                    )
-                    logger.info(
-                        "ACP session/set_model: %s -> %s (requested %r)",
-                        _current or "?", _target, model,
-                    )
-            except Exception:
-                logger.debug("ACP session/set_model skipped/failed", exc_info=True)
+        # Bind the requested model on this session. The model is fixed once at
+        # session start — never switched mid-session (cache-safe; no-touch #1).
+        self._select_session_model(conn, session, session_id, model, timeout_seconds)
 
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        self._acp_request(
+        prompt_result = self._acp_request(
             conn,
             "session/prompt",
             {
@@ -816,7 +848,86 @@ class CopilotACPClient:
             text_parts=text_parts,
             reasoning_parts=reasoning_parts,
         )
-        return "".join(text_parts), "".join(reasoning_parts)
+        # ``PromptResponse.usage`` (claude-agent-acp >=0.48; UNSTABLE field) carries
+        # real per-turn tokens incl. cache reads — the only truthful usage signal on
+        # the ACP path. Absent (Copilot / old claude-code-acp) -> None -> zeros.
+        acp_usage = None
+        if isinstance(prompt_result, dict):
+            _u = prompt_result.get("usage")
+            if isinstance(_u, dict):
+                acp_usage = _u
+        return "".join(text_parts), "".join(reasoning_parts), acp_usage
+
+    def _select_session_model(
+        self,
+        conn: "_AcpConnection",
+        session: dict[str, Any],
+        session_id: str,
+        model: str | None,
+        timeout_seconds: float,
+    ) -> None:
+        """Pin the requested model on a fresh session, supporting both ACP wire
+        shapes (back-compat) and no-op for servers without a model menu:
+
+        * claude-agent-acp (>=0.48): model lives in ``result.configOptions[id=model]``
+          and is set via ``session/set_config_option {configId:"model", value}``.
+          (``result.models`` is ``null`` here.)
+        * claude-code-acp (0.16.2): model lives in ``result.models.availableModels``
+          and is set via ``session/set_model {modelId}``.
+        * Copilot ACP: advertises neither -> no-op.
+        """
+        if not model:
+            return
+        try:
+            # New adapter: configOptions[id=model] + session/set_config_option
+            for opt in (session.get("configOptions") or []):
+                if not (isinstance(opt, dict) and opt.get("id") == "model"):
+                    continue
+                options = opt.get("options") or []
+                current = str(opt.get("currentValue") or "").strip()
+                mapped = [
+                    {
+                        "modelId": o.get("value"),
+                        "name": o.get("name"),
+                        "description": o.get("description"),
+                    }
+                    for o in options
+                    if isinstance(o, dict)
+                ]
+                target = _match_acp_model_id(model, mapped)
+                if target and target != current:
+                    self._acp_request(
+                        conn,
+                        "session/set_config_option",
+                        {"sessionId": session_id, "configId": "model", "value": target},
+                        timeout_seconds=timeout_seconds,
+                    )
+                    logger.info(
+                        "ACP session/set_config_option model: %s -> %s (requested %r)",
+                        current or "?", target, model,
+                    )
+                return
+            # Old adapter: result.models.availableModels + session/set_model
+            models = session.get("models") or {}
+            available = models.get("availableModels") or []
+            if available:
+                current = str(models.get("currentModelId") or "").strip()
+                target = _match_acp_model_id(model, available)
+                if target and target != current:
+                    self._acp_request(
+                        conn,
+                        "session/set_model",
+                        {"sessionId": session_id, "modelId": target},
+                        timeout_seconds=timeout_seconds,
+                    )
+                    logger.info(
+                        "ACP session/set_model: %s -> %s (requested %r)",
+                        current or "?", target, model,
+                    )
+                return
+            # Copilot / no model menu: nothing to bind.
+        except Exception:
+            logger.debug("ACP model selection skipped/failed", exc_info=True)
 
     def _acp_request(
         self,

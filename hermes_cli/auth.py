@@ -6325,19 +6325,29 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         base_url = pconfig.inference_base_url
 
     if provider_id == "claude-code-acp":
-        # Path C: the claude-code-acp adapter (npm @zed-industries/claude-code-acp)
-        # is itself an ACP-over-stdio server, so it needs no --acp/--stdio flags.
-        # It runs under the host's Claude subscription OAuth login (do NOT set
-        # ANTHROPIC_API_KEY; do NOT pass --bare) → consumes included weekly quota.
+        # Path C: the official Claude ACP adapter is itself an ACP-over-stdio
+        # server, so it needs no --acp/--stdio flags. It runs under the host's
+        # Claude subscription OAuth login (do NOT set ANTHROPIC_API_KEY; do NOT
+        # pass --bare) → consumes included weekly quota.
+        #
+        # The package was renamed @zed-industries/claude-code-acp (bin
+        # `claude-code-acp`, frozen at 0.16.2, no usage reporting) ->
+        # @agentclientprotocol/claude-agent-acp (bin `claude-agent-acp`, >=0.48,
+        # reports PromptResponse.usage + uses session/set_config_option for model
+        # selection). Prefer the new bin; fall back to the old one if only it is
+        # installed (the ExternalACPClient handles both wire shapes). Roll back to
+        # the old adapter with HERMES_CLAUDE_CODE_ACP_COMMAND=claude-code-acp.
         command = (
             os.getenv("HERMES_CLAUDE_CODE_ACP_COMMAND", "").strip()
             or os.getenv("CLAUDE_CODE_ACP_PATH", "").strip()
-            or "claude-code-acp"
+            or shutil.which("claude-agent-acp")
+            or shutil.which("claude-code-acp")
+            or "claude-agent-acp"
         )
         raw_args = os.getenv("HERMES_CLAUDE_CODE_ACP_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else []
         missing_hint = (
-            "Install it: npm i -g @zed-industries/claude-code-acp "
+            "Install it: npm i -g @agentclientprotocol/claude-agent-acp "
             "(or set HERMES_CLAUDE_CODE_ACP_COMMAND to its path)."
         )
         api_key_placeholder = "claude-code-acp"

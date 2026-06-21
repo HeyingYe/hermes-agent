@@ -316,6 +316,49 @@ trajectory-only and stripped before send.
   config; the loop advances `_fallback_index` through `_fallback_chain` on
   overloaded/exhausted errors.
 
+### Jarvis token-maximization: subscription routing + warm ACP pool
+
+The "fill the paid quota" layer (spec `~/jarvis-ops/docs/jarvis-token-maximization-spec.md`,
+branch `feat/jarvis-token-max`) rides on top of the provider system as **internal modules
++ config**, invisible to the model (no new core tool, no schema/system-prompt change):
+
+- **Routing decision** (`agent/route_decision.py`): pure `decide_route(RouteFeatures)` →
+  subscription provider `claude-code-acp`, simple→Sonnet / complex→Opus (`complexity >= 4`
+  or high-stakes ≥3). `classify_pool()` labels billing pools
+  (included_sonnet / included_opus / extra400 / codex). Fail-silent observability writes
+  `logs/route_decisions.jsonl`. Consumed only when `route_decision.enabled` (else pure no-op).
+- **Session pin** (`gateway/run.py` `_maybe_pin_route_decision` → `_resolve_session_agent_runtime`):
+  decides once on a session's first turn, writes `_session_model_overrides`, then the
+  override fast-path reuses provider/model/command/args every turn — cache-safe, never
+  re-decided mid-session (no-touch #1).
+- **Subscription transport** (`agent/copilot_acp_client.py`): `ExternalACPClient`
+  (generalized from the Copilot client) drives the official Claude ACP adapter over
+  ACP JSON-RPC → consumes the subscription's included weekly quota (OAuth, **never** API key).
+  `_AcpConnection` = one subprocess + reader threads + JSON-RPC inbox; `_AcpPool` =
+  module-level warm-process pool (key=`(command,args,cwd)`, lazy reap on acquire/release +
+  atexit), gated by `route_decision.acp_persistent_process` (default off = spawn-per-call).
+- **Adapter generations** — the client speaks both ACP wire shapes (back-compat):
+  `@zed-industries/claude-code-acp@0.16.2` (bin `claude-code-acp`, model via
+  `result.models.availableModels` + `session/set_model`, **no usage**) and
+  `@agentclientprotocol/claude-agent-acp>=0.48` (bin `claude-agent-acp`, model via
+  `result.configOptions[id=model]` + `session/set_config_option`, **reports
+  `PromptResponse.usage`**). `auth.py` prefers the new bin, falls back to the old;
+  `_select_session_model` picks the wire method per session/new shape; Copilot advertises
+  neither → no-op. Roll back to the old adapter with `HERMES_CLAUDE_CODE_ACP_COMMAND=claude-code-acp`.
+- **Real usage (item 4)** — `_acp_usage_to_namespace` maps the new adapter's
+  `PromptResponse.usage` (`inputTokens/outputTokens/cachedReadTokens/cachedWriteTokens`,
+  Anthropic semantics) into the OpenAI chat_completions shape `normalize_usage()` reads, so
+  `cachedReadTokens` becomes the real cache-hit ruler in `route_decisions.jsonl` (absent →
+  zeros → `observe_usage` falls back to the `context_tokens` estimate). NOTE: the new SDK
+  (0.3.x) bundles a per-arch `claude` that hangs under an x64-Rosetta node → `_build_subprocess_env`
+  pins `CLAUDE_CODE_EXECUTABLE` to the native system `claude` (override `HERMES_CLAUDE_CODE_EXECUTABLE`).
+- **ACP detection guards** — three sibling predicates that MUST all match the dispatch in
+  `agent_runtime_helpers.create_openai_client` (`provider in (copilot-acp, claude-code-acp)`
+  or `base_url` starts `acp://`): command-population + Responses-upgrade exclusion
+  (`agent_init.py`), streaming-disable (`conversation_loop.py`). A half-broadened guard
+  ships the wrong spawn command (`copilot` instead of `claude-code-acp`) — see commit
+  `4bb5c706a`.
+
 ### Cheat-sheet
 
 | Symptom | Start here |
@@ -326,6 +369,9 @@ trajectory-only and stripped before send.
 | Context length wrong → premature compression | `agent/model_metadata.py` / `models_dev.py` |
 | Curator/vision using wrong model | `agent/auxiliary_client.py` `_resolve_auto` + `auxiliary:` config |
 | Fallback not kicking in | `_fallback_chain` activation in the loop |
+| Subscription routing wrong / not pinned | `agent/route_decision.py` (`decide_route`) + `gateway/run.py` (`_maybe_pin_route_decision`) |
+| claude-code-acp spawns wrong CLI / streaming breaks | the 3 ACP guards (`agent_init.py` command-pop & Responses-upgrade, `conversation_loop.py` streaming) — must match the `create_openai_client` dispatch |
+| ACP per-call cold-start latency / warm pool | `agent/copilot_acp_client.py` `_AcpPool` / `_AcpConnection`; flag `route_decision.acp_persistent_process` |
 
 ---
 
