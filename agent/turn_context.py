@@ -375,6 +375,21 @@ def build_turn_context(
         except Exception:
             pass
 
+    # P0 observability (Jarvis token-maximization): zero-behavior-change read-only
+    # route-decision logging. Computes a (currently unused) route decision and
+    # stashes a pending record on the agent; ``observe_usage`` flushes it after the
+    # first API call. Fully fail-silent — never mutates messages or model choice.
+    # See agent/route_decision.py.
+    try:
+        from agent import route_decision as _route_decision
+
+        _route_decision.observe_turn_start(
+            agent, user_message, conversation_history, messages,
+            task_id=effective_task_id, turn_id=turn_id,
+        )
+    except Exception:
+        pass
+
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,

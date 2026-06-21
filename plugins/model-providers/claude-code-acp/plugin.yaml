@@ -1,0 +1,5 @@
+name: claude-code-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Claude Code (subscription) via claude-code-acp ACP subprocess — consumes included weekly quota (Jarvis token-maximization Path C)
+author: jarvis-ops

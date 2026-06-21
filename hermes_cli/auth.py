@@ -235,6 +235,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    # Jarvis token-maximization Path C: drive the official claude-code-acp adapter
+    # under the host's Claude subscription OAuth login → included weekly quota.
+    "claude-code-acp": ProviderConfig(
+        id="claude-code-acp",
+        name="Claude Code ACP (subscription)",
+        auth_type="external_process",
+        inference_base_url="acp://claude-code",
+        base_url_env_var="CLAUDE_CODE_ACP_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -6315,25 +6324,45 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "claude-code-acp":
+        # Path C: the claude-code-acp adapter (npm @zed-industries/claude-code-acp)
+        # is itself an ACP-over-stdio server, so it needs no --acp/--stdio flags.
+        # It runs under the host's Claude subscription OAuth login (do NOT set
+        # ANTHROPIC_API_KEY; do NOT pass --bare) → consumes included weekly quota.
+        command = (
+            os.getenv("HERMES_CLAUDE_CODE_ACP_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CODE_ACP_PATH", "").strip()
+            or "claude-code-acp"
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_CODE_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        missing_hint = (
+            "Install it: npm i -g @zed-industries/claude-code-acp "
+            "(or set HERMES_CLAUDE_CODE_ACP_COMMAND to its path)."
+        )
+        api_key_placeholder = "claude-code-acp"
+    else:  # copilot-acp (default external-process provider)
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        missing_hint = "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        api_key_placeholder = "copilot-acp"
+
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the '{provider_id}' command '{command}'. {missing_hint}",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key_placeholder,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -26,6 +27,8 @@ from agent.redact import redact_sensitive_text
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+
+logger = logging.getLogger(__name__)
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -68,6 +71,40 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
+def _match_acp_model_id(requested: str, available: list[dict[str, Any]]) -> str | None:
+    """Map a requested model name to an ACP ``availableModels[].modelId``.
+
+    The claude-code-acp adapter advertises modelIds like ``sonnet`` / ``haiku`` /
+    ``default`` (+ any host-custom id such as ``claude-opus-4-8``). Match exact id
+    first, then a substring on id/name, then a family token (opus/sonnet/haiku)
+    over id+name+description. Returns ``None`` when nothing matches (the caller
+    then keeps the session's current model). Copilot ACP advertises no model menu,
+    so this is never reached for it.
+    """
+    if not requested or not available:
+        return None
+    req = requested.strip().lower()
+    for m in available:
+        if str(m.get("modelId") or "").lower() == req:
+            return str(m.get("modelId"))
+    for m in available:
+        mid = str(m.get("modelId") or "").lower()
+        name = str(m.get("name") or "").lower()
+        if mid and (req in mid or mid in req):
+            return str(m.get("modelId"))
+        if name and (req in name or name in req):
+            return str(m.get("modelId"))
+    for fam in ("opus", "sonnet", "haiku"):
+        if fam in req:
+            for m in available:
+                blob = (
+                    f"{m.get('modelId') or ''} {m.get('name') or ''} {m.get('description') or ''}"
+                ).lower()
+                if fam in blob:
+                    return str(m.get("modelId"))
+    return None
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
     home = os.environ.get("HOME", "").strip()
@@ -99,6 +136,12 @@ def _build_subprocess_env() -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    # Never let a spawned Claude Code session inherit our nesting markers: the
+    # claude-code-acp adapter boots `claude`, which refuses to run "inside another
+    # Claude Code session" when CLAUDECODE is set. Only relevant when Hermes itself
+    # runs inside a Claude Code session; harmless for Copilot.
+    for _nest in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+        env.pop(_nest, None)
     return env
 
 
@@ -344,7 +387,12 @@ class CopilotACPClient:
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        # Distinguish an explicit empty arg list (e.g. the claude-code-acp adapter
+        # needs NO --acp/--stdio flags) from "args not provided". A plain
+        # `acp_args or args or default` would treat ``[]`` as falsy and wrongly
+        # fall through to the Copilot default.
+        _args = acp_args if acp_args is not None else args
+        self._acp_args = list(_args if _args is not None else _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
@@ -403,6 +451,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -428,7 +477,7 @@ class CopilotACPClient:
             model=model or "copilot-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -568,6 +617,26 @@ class CopilotACPClient:
             if not session_id:
                 raise RuntimeError("Copilot ACP did not return a sessionId.")
 
+            # Bind the requested model on this session via ACP ``session/set_model``.
+            # The claude-code-acp adapter advertises availableModels/currentModelId
+            # under ``result.models``; Copilot ACP advertises none, so this is a
+            # no-op there. The model is fixed once at session start — never switched
+            # mid-session (cache-safe; no-touch #1).
+            if model:
+                try:
+                    _models = session.get("models") or {}
+                    _available = _models.get("availableModels") or []
+                    _current = str(_models.get("currentModelId") or "").strip()
+                    _target = _match_acp_model_id(model, _available)
+                    if _target and _target != _current:
+                        _request("session/set_model", {"sessionId": session_id, "modelId": _target})
+                        logger.info(
+                            "ACP session/set_model: %s -> %s (requested %r)",
+                            _current or "?", _target, model,
+                        )
+                except Exception:
+                    logger.debug("ACP session/set_model skipped/failed", exc_info=True)
+
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             _request(
@@ -677,3 +746,12 @@ class CopilotACPClient:
         process.stdin.write(json.dumps(response) + "\n")
         process.stdin.flush()
         return True
+
+
+# Provider-agnostic alias. This facade is not Copilot-specific: the command, args,
+# base_url and api_key are all injected per provider, and the ACP wire protocol
+# (initialize / session/new / session/prompt / session/update chunks) is the Zed
+# Agent Client Protocol that any conformant ACP-over-stdio CLI speaks. The Jarvis
+# token-maximization Path C drives the official `claude-code-acp` adapter through
+# this same client. New call sites should import ``ExternalACPClient``.
+ExternalACPClient = CopilotACPClient

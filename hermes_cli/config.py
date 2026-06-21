@@ -1945,6 +1945,28 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
     },
 
+    # Route-decision observability + (future) resource-aware routing.
+    # Jarvis token-maximization plan, P0. In P0 this is OBSERVABILITY ONLY:
+    #   enabled=false  -> decide_route() output is computed but NOT consumed
+    #                     (model selection is unchanged; strict no-op on behavior).
+    #   log=true       -> append one JSONL record per turn to ``log_path``
+    #                     describing the actual pool used + the planned route +
+    #                     realized cache-hit/token usage (the spend×quality baseline).
+    # Roll back logging with ``route_decision.log: false`` (and delete the JSONL);
+    # routing stays off until ``enabled: true`` (P1+).
+    "route_decision": {
+        "enabled": False,
+        "log": True,
+        "log_path": "",  # empty = $HERMES_HOME/logs/route_decisions.jsonl
+        # T1.3 routing (only consumed when enabled=true): pin the subscription
+        # provider once per session — simple→sonnet_model, complex→opus_model
+        # (complexity >= opus_complexity_min, L1-L5 heuristic). Roll back with
+        # enabled:false (→ instant return to the configured gpt-5.5/codex engine).
+        "sonnet_model": "claude-sonnet-4-6",
+        "opus_model": "claude-opus-4-8",
+        "opus_complexity_min": 4,
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
@@ -4330,7 +4352,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "route_decision",
 }
 
 # Valid fields inside a custom_providers list entry

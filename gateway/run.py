@@ -3150,12 +3150,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _maybe_pin_route_decision(self, session_key: str, user_message: str) -> None:
+        """T1.3 (Jarvis token-maximization): pin the subscription engine/model for
+        this session **once**, gated by ``route_decision.enabled``.
+
+        Writes a ``claude-code-acp`` entry into ``_session_model_overrides`` so the
+        session's model is decided on its first turn (simple→Sonnet / complex→Opus)
+        and then stays stable for every subsequent turn — never re-decided or
+        switched mid-session (cache-safe; no-touch #1). Richer effort mid-session
+        comes from spawning a child, never from mutating this parent.
+
+        Fail-silent and a strict no-op when disabled: any error (or enabled=false)
+        leaves routing untouched, so the session falls back to the configured engine
+        (gpt-5.5). Roll back globally with ``route_decision.enabled:false``.
+        """
+        try:
+            if not session_key or self._session_model_overrides.get(session_key):
+                return  # already pinned (by us or an explicit /model) — keep sticky
+            from agent import route_decision as _rd
+
+            if not _rd.is_enabled():
+                return
+            decision = _rd.decide_route(_rd.features_from_message(user_message))
+            if decision.provider != "claude-code-acp":
+                return
+            from hermes_cli.auth import resolve_external_process_provider_credentials
+
+            creds = resolve_external_process_provider_credentials("claude-code-acp")
+            self._session_model_overrides[session_key] = {
+                "model": decision.model,
+                "provider": "claude-code-acp",
+                "api_key": creds.get("api_key"),
+                "base_url": creds.get("base_url"),
+                "api_mode": "chat_completions",
+                "command": creds.get("command"),
+                "args": list(creds.get("args") or []),
+            }
+            logger.info(
+                "route_decision: pinned session=%s -> %s/%s (pool=%s)",
+                session_key, decision.provider, decision.model, decision.pool,
+            )
+        except Exception:
+            logger.debug("route_decision pin skipped/failed", exc_info=True)
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        user_message: str = "",
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -3170,6 +3214,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 resolved_session_key = None
 
+        # T1.3 routing: on a session's first turn (when route_decision.enabled), pin
+        # the subscription provider/model so the override fast-path below applies it,
+        # stable for the whole session. No-op when disabled or already pinned.
+        if user_message and resolved_session_key:
+            self._maybe_pin_route_decision(resolved_session_key, user_message)
+
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
@@ -3180,6 +3230,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
+                # External-process providers (copilot-acp / claude-code-acp) need the
+                # spawned CLI command+args threaded through the override fast-path.
+                "command": override.get("command"),
+                "args": list(override.get("args") or []),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -10958,6 +11012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
+                user_message=prompt or "",
             )
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
@@ -15035,6 +15090,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    user_message=message or "",
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",

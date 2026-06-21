@@ -1897,6 +1897,16 @@ def run_conversation(
                         api_duration, _cache_pct,
                     )
 
+                    # P0 observability (Jarvis token-maximization): enrich the
+                    # pending route-decision record with realized usage and flush
+                    # it once per turn. Fail-silent; never affects the loop.
+                    try:
+                        from agent import route_decision as _route_decision
+
+                        _route_decision.observe_usage(agent, canonical_usage, prompt_tokens)
+                    except Exception:
+                        pass
+
                     cost_result = estimate_usage_cost(
                         agent.model,
                         canonical_usage,
