@@ -888,6 +888,29 @@ DEFAULT_CONFIG = {
     "max_concurrent_sessions": None,
     "agent": {
         "max_turns": 90,
+        # P5.1 token circuit breaker: cap total context tokens SENT
+        # (prompt_tokens = input + cached input) to halt runaway loops that
+        # re-send a huge context on every iteration — a failure mode the
+        # iteration-count cap (max_turns) misses. Measured on prompt_tokens
+        # because such loops are dominated by cache_read; uncached input stays
+        # tiny. 0 = unlimited for that scope; enabled=false disables the breaker.
+        "token_budget": {
+            "enabled": True,
+            "per_turn_prompt_tokens": 3000000,
+            "per_session_prompt_tokens": 8000000,
+            # P5.4 in-turn expensive-model (Opus) guard: while the ACTIVE model is
+            # in expensive_models, the smaller of the normal cap and these tighter
+            # caps applies — so an Opus grunt loop is cut sooner than a gpt-5.5 one.
+            # 0 = no separate expensive cap. (This is a tighter budget, NOT mid-turn
+            # model-switching, which stays an architectural change.)
+            "expensive_models": [
+                "claude-opus-4-8",
+                "claude-opus-4-6",
+                "claude-opus-4-5",
+            ],
+            "per_turn_prompt_tokens_expensive": 1500000,
+            "per_session_prompt_tokens_expensive": 4000000,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1228,11 +1251,17 @@ DEFAULT_CONFIG = {
             "exact_failure": 2,
             "same_tool_failure": 3,
             "idempotent_no_progress": 2,
+            # P5.2: consecutive read-only (idempotent) calls with no writes/edits.
+            "readonly_streak": 30,
         },
         "hard_stop_after": {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+            # P5.2: halt a no-progress read-only exploration loop (only when
+            # hard_stop_enabled). Catches "many different read_file calls" loops
+            # that the per-signature idempotent_no_progress detector misses.
+            "readonly_streak": 60,
         },
     },
 

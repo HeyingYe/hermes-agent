@@ -77,6 +77,11 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    # P5.2: cross-signature read-only streak — consecutive idempotent calls with
+    # no mutating/progress call in between (catches "80 read_file over different
+    # files" loops that the per-signature no_progress detector above misses).
+    readonly_streak_warn_after: int = 30
+    readonly_streak_block_after: int = 60
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -120,6 +125,14 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            readonly_streak_warn_after=_positive_int(
+                warn_after.get("readonly_streak", data.get("readonly_streak_warn_after")),
+                defaults.readonly_streak_warn_after,
+            ),
+            readonly_streak_block_after=_positive_int(
+                hard_stop_after.get("readonly_streak", data.get("readonly_streak_block_after")),
+                defaults.readonly_streak_block_after,
             ),
         )
 
@@ -232,6 +245,9 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        # P5.2: count of consecutive read-only (idempotent) successful calls
+        # since the last mutating/progress call this turn.
+        self._readonly_streak = 0
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -349,6 +365,7 @@ class ToolCallGuardrailController:
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
+            self._readonly_streak = 0  # P5.2: a mutating/progress call breaks the streak
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         result_hash = _result_hash(result)
@@ -357,6 +374,46 @@ class ToolCallGuardrailController:
         if previous is not None and previous[0] == result_hash:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
+
+        # P5.2: cross-signature read-only streak. Distinct args (e.g. different
+        # files) produce distinct signatures, so the per-signature detector above
+        # never fires on an exploration loop. Count consecutive idempotent calls
+        # regardless of args; a mutating call resets it (see the early return
+        # above). Halt only when hard stops are enabled.
+        self._readonly_streak += 1
+        if (
+            self.config.hard_stop_enabled
+            and self._readonly_streak >= self.config.readonly_streak_block_after
+        ):
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="readonly_no_progress_halt",
+                message=(
+                    f"Stopped: {self._readonly_streak} consecutive read-only tool calls this "
+                    "turn with no writes/edits (no progress). Stop exploring and either act "
+                    "on what you've already gathered or explain the blocker."
+                ),
+                tool_name=tool_name,
+                count=self._readonly_streak,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+        if (
+            self.config.warnings_enabled
+            and self._readonly_streak == self.config.readonly_streak_warn_after
+        ):
+            return ToolGuardrailDecision(
+                action="warn",
+                code="readonly_no_progress_warning",
+                message=(
+                    f"{self._readonly_streak} read-only calls in a row with no writes/edits. "
+                    "If you're stuck exploring, act on what you have or change approach."
+                ),
+                tool_name=tool_name,
+                count=self._readonly_streak,
+                signature=signature,
+            )
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(

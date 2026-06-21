@@ -31,6 +31,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.token_budget import TokenBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
@@ -466,6 +467,43 @@ def _content_policy_blocked_result(
     }
 
 
+def _ensure_token_budget(agent):
+    """Get-or-create the agent's P5.1 :class:`TokenBudget` (cached on the agent).
+
+    Limits come from config ``agent.token_budget`` and are read once per agent.
+    A scope limit of 0 = unlimited; ``enabled=False`` disables the breaker.
+    Fails open (defaults) if config can't be read.
+    """
+    tb = getattr(agent, "token_budget", None)
+    if tb is not None:
+        return tb
+    enabled, per_turn, per_session = True, 3_000_000, 8_000_000
+    exp_per_turn, exp_per_session, exp_models = 1_500_000, 4_000_000, ()
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = ((load_config_readonly() or {}).get("agent", {}) or {}).get("token_budget", {}) or {}
+        enabled = bool(cfg.get("enabled", enabled))
+        per_turn = int(cfg.get("per_turn_prompt_tokens", per_turn) or 0)
+        per_session = int(cfg.get("per_session_prompt_tokens", per_session) or 0)
+        # P5.4: tighter caps + model list for in-turn expensive-model (Opus) guard
+        exp_per_turn = int(cfg.get("per_turn_prompt_tokens_expensive", exp_per_turn) or 0)
+        exp_per_session = int(cfg.get("per_session_prompt_tokens_expensive", exp_per_session) or 0)
+        exp_models = tuple(cfg.get("expensive_models") or ())
+    except Exception as _tb_err:  # pragma: no cover - defensive
+        logger.debug("token_budget config load failed, using defaults: %s", _tb_err)
+    tb = TokenBudget(
+        per_turn_limit=per_turn,
+        per_session_limit=per_session,
+        enabled=enabled,
+        expensive_per_turn_limit=exp_per_turn,
+        expensive_per_session_limit=exp_per_session,
+        expensive_models=exp_models,
+    )
+    agent.token_budget = tb
+    return tb
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -546,6 +584,12 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
+    # P5.1: refresh the per-turn token budget. The per-session total persists
+    # across turns (reset only in reset_session_state). This caps total context
+    # tokens SENT and stops runaway loops that re-send a large context every
+    # iteration — see agent/token_budget.py.
+    _ensure_token_budget(agent).reset_turn()
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -572,6 +616,24 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
         
+        # P5.1: token circuit breaker. Checked at the top of each iteration
+        # against tokens already spent on prior calls this turn/session, so we
+        # stop BEFORE sending another large context. prompt_tokens (input +
+        # cached input) is the right signal — runaway loops are dominated by
+        # cache_read, not uncached input. 0-limit scopes are skipped.
+        _tb = getattr(agent, "token_budget", None)
+        # P5.4: while on an expensive model (Opus), the tighter expensive caps apply.
+        _tok_breach = _tb.breach(expensive=_tb.is_expensive(agent.model)) if _tb else None
+        if _tok_breach:
+            _turn_exit_reason = f"token_budget_exhausted:{_tok_breach}"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Token budget exhausted ({_tok_breach}: turn="
+                    f"{agent.token_budget.turn_used:,} / session={agent.token_budget.session_used:,} "
+                    f"prompt-tokens) — stopping this turn to prevent runaway cost."
+                )
+            break
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -1819,6 +1881,11 @@ def run_conversation(
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+                    # P5.1: feed the circuit breaker with the context tokens sent
+                    # on this call (prompt_tokens = input + cached input).
+                    if getattr(agent, "token_budget", None) is not None:
+                        agent.token_budget.add(prompt_tokens)
+
                     # Log API call details for debugging/observability
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
@@ -1876,6 +1943,23 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                            )
+                            # P5.3: record the TRUE per-model breakdown so a
+                            # mixed-model session (e.g. mostly Opus + some
+                            # gpt-5.5) is not mis-attributed to sessions.model.
+                            agent._session_db.record_model_usage(
+                                agent.session_id,
+                                agent.model,
+                                agent.provider or "",
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                reasoning_tokens=canonical_usage.reasoning_tokens,
+                                api_calls=1,
                             )
                         except Exception as e:
                             # Log token persistence failures so they're
