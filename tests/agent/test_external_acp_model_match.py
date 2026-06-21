@@ -55,3 +55,58 @@ def test_explicit_empty_args_not_overridden():
     assert ExternalACPClient(command="/bin/echo", args=[])._acp_args == []
     # But "no args provided" still defaults to Copilot's flags.
     assert ExternalACPClient(command="/bin/echo")._acp_args == ["--acp", "--stdio"]
+
+
+def test_claude_code_acp_threads_command_through_agent_init():
+    """Regression (token-max live E2E, 2026-06-21): the gateway pins
+    provider=claude-code-acp / base_url=acp://claude-code and passes the spawn
+    command via the generic ``command`` kwarg. ``init_agent`` must thread it
+    into ``_client_kwargs`` so the built ExternalACPClient launches
+    'claude-code-acp', NOT the Copilot default 'copilot'.
+
+    A half-broadened guard (``provider == "copilot-acp"`` only) silently
+    dropped the command for claude-code-acp, so the bot launched 'copilot'
+    (not installed) and erred on every routed turn. Invariant: any external
+    ACP provider threads its own command + args.
+    """
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="claude-code-acp",
+        base_url="acp://claude-code",
+        provider="claude-code-acp",
+        api_mode="chat_completions",
+        command="claude-code-acp",
+        args=[],
+        model="claude-sonnet-4-6",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent._client_kwargs.get("command") == "claude-code-acp"
+    assert isinstance(agent.client, ExternalACPClient)
+    assert agent.client._acp_command == "claude-code-acp"
+    # claude-code-acp's explicit empty args must survive (no Copilot flags).
+    assert agent.client._acp_args == []
+
+
+def test_copilot_acp_command_threading_not_regressed():
+    """The broadening must not regress copilot-acp: it still threads its own
+    command and default --acp/--stdio flags."""
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        provider="copilot-acp",
+        api_mode="chat_completions",
+        command="copilot",
+        args=["--acp", "--stdio"],
+        model="gpt-5.5",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent._client_kwargs.get("command") == "copilot"
+    assert agent.client._acp_command == "copilot"
+    assert agent.client._acp_args == ["--acp", "--stdio"]
