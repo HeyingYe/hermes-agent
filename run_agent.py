@@ -1034,6 +1034,12 @@ class AIAgent:
             "base_url": getattr(self, "base_url", "") or "",
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
+            # External-process (ACP) providers need the spawn command+args threaded
+            # to forks/auxiliaries. Without these a claude-code-acp fork (e.g. the
+            # background review) falls back to the 'copilot' default command and
+            # fails to start ("Could not start Copilot ACP command 'copilot'").
+            "command": getattr(self, "acp_command", "") or "",
+            "args": list(getattr(self, "acp_args", []) or []),
         }
 
     def _check_compression_model_feasibility(self) -> None:

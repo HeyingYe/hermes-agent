@@ -372,6 +372,15 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
   (`agent_init.py`), streaming-disable (`conversation_loop.py`). A half-broadened guard
   ships the wrong spawn command (`copilot` instead of `claude-code-acp`) — see commit
   `4bb5c706a`.
+  - **Forks must inherit the spawn command (2026-06-23).** The background-review fork
+    (`agent/background_review.py`) builds its own `AIAgent` from `_current_main_runtime()`.
+    That dict previously carried provider/base_url but NOT `command`/`args`, so a
+    `claude-code-acp` review fork fell back to the `copilot` default and died with
+    "Could not start Copilot ACP command 'copilot'" (24×/day, thread=bg-review).
+    Fix: `_current_main_runtime()` (`run_agent.py`) now exposes `command`/`args` (from
+    `self.acp_command`/`acp_args`), and the review fork threads them via
+    `acp_command=`/`acp_args=`. Any new fork/auxiliary that rebuilds an ACP agent from
+    the parent runtime MUST thread these too.
 
 ### Cheat-sheet
 
@@ -573,6 +582,15 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 - **Not durable:** if the parent turn is interrupted, the child is cancelled. For work
   that must outlive the turn, use `cronjob` or `terminal(background=True,
   notify_on_complete=True)`.
+- **External-ACP children inherit memory + profile.** Children are built with
+  `skip_memory=True`, so a native subagent runs memory-free by design. But a child that
+  runs over an **external ACP transport** (`effective_acp_command` set — e.g. Claude Code
+  via `claude-code-acp`) builds no volatile block of its own, so
+  `_maybe_inject_parent_memory` snapshots the parent's memory + USER profile +
+  external-memory block (via `system_prompt.build_memory_profile_block`, timestamp
+  excluded) into the child's `ephemeral_system_prompt` at spawn time. Delegated Claude
+  Code agents thus carry the same memory/profile context as the main session; native
+  (non-ACP) children are unaffected.
 
 ### F. Cron & Kanban  (`cron/scheduler.py`, `cron/jobs.py`; `hermes_cli/kanban.py`, `tools/kanban_tools.py`)
 
@@ -581,6 +599,15 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
   `cron/.tick.lock` file lock against duplicate ticks, and `skip_memory=True` by
   default. Cron output lands in its own session (framed header/footer) so the main
   conversation's role alternation stays intact.
+  - **Cron routing (token-maximization, 2026-06-23):** cron jobs do NOT go through
+    the gateway's `_maybe_pin_route_decision`, so by default they ran on the base
+    `config.model.default` (gpt-5.5/Codex) and failed on Codex `usage_limit`. The
+    scheduler now repoints them through the Claude subscription: when
+    `route_decision.enabled` + `route_decision.cron_via_acp` (default true) and the
+    job pins no provider/model, it resolves `claude-code-acp` creds and runs on
+    `route_decision.cron_model` (default `claude-sonnet-4-6`). Fail-silent — any
+    error keeps the originally-resolved runtime (no regression). See the block right
+    after `resolve_runtime_provider()` in `scheduler.py`.
 - **Kanban:** durable SQLite board (`kanban.db`) for multi-profile collaboration. A
   dispatcher loop (default in-gateway) reclaims stale claims, promotes ready tasks,
   atomically claims, and spawns assigned profiles. **Board** is the hard isolation

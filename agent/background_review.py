@@ -527,6 +527,12 @@ def _run_review_in_thread(
                 api_mode=_parent_api_mode,
                 base_url=_parent_runtime.get("base_url") or None,
                 api_key=_parent_runtime.get("api_key") or None,
+                # Thread the parent's resolved ACP spawn command/args so a
+                # claude-code-acp review fork uses 'claude-agent-acp' instead of
+                # defaulting to the 'copilot' command (which isn't installed) and
+                # failing with "Could not start Copilot ACP command 'copilot'".
+                acp_command=_parent_runtime.get("command") or None,
+                acp_args=_parent_runtime.get("args") or None,
                 credential_pool=getattr(agent, "_credential_pool", None),
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),

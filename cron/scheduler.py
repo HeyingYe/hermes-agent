@@ -1738,6 +1738,40 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
+        # Jarvis token-maximization: route cron jobs through the Claude subscription
+        # (claude-code-acp) so scheduled work no longer falls back to gpt-5.5/Codex
+        # (which hits usage_limit and fails the job, e.g. "provider rate limit.
+        # Fallback chain was exhausted"). Operator policy: cron uses Sonnet (the
+        # abundant included pool), reserving Opus for interactive complex work.
+        # Fail-silent: any error keeps the originally-resolved runtime (no regression).
+        # Skipped when the job explicitly pins its own provider/model.
+        try:
+            _rd = _cfg.get("route_decision") if isinstance(_cfg.get("route_decision"), dict) else {}
+            if (
+                _rd.get("enabled")
+                and _rd.get("cron_via_acp", True)
+                and not job.get("provider")
+                and not job.get("model")
+            ):
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                _acp_creds = resolve_external_process_provider_credentials("claude-code-acp")
+                if _acp_creds and _acp_creds.get("command"):
+                    model = _rd.get("cron_model") or "claude-sonnet-4-6"
+                    runtime = {
+                        "provider": "claude-code-acp",
+                        "api_key": _acp_creds.get("api_key"),
+                        "base_url": _acp_creds.get("base_url"),
+                        "api_mode": "chat_completions",
+                        "command": _acp_creds.get("command"),
+                        "args": list(_acp_creds.get("args") or []),
+                    }
+                    logger.info(
+                        "Job '%s': routed via claude-code-acp -> %s (cron_via_acp policy)",
+                        job_id, model,
+                    )
+        except Exception as _rd_exc:
+            logger.warning("Job '%s': cron ACP routing skipped (%s); using %s", job_id, _rd_exc, runtime.get("provider"))
+
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
