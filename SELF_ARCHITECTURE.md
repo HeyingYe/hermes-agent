@@ -352,6 +352,20 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
   zeros → `observe_usage` falls back to the `context_tokens` estimate). NOTE: the new SDK
   (0.3.x) bundles a per-arch `claude` that hangs under an x64-Rosetta node → `_build_subprocess_env`
   pins `CLAUDE_CODE_EXECUTABLE` to the native system `claude` (override `HERMES_CLAUDE_CODE_EXECUTABLE`).
+- **Persistent session (T2b)** — `route_decision.acp_persistent_session` (default off): module-level
+  `_T2B` registry keyed by `(command,args,cwd, sha1(first system+first user))` holds a dedicated
+  connection + ACP sessionId + `sent_hashes`. `_run_persistent` sends only the new *non-assistant*
+  turns (`_format_delta_as_prompt`); Claude Code then caches the conversation turn-by-turn (live:
+  **99% cache read on a 1.15M context**, vs ~8% for the fresh full-resend the loop does otherwise —
+  fresh keeps history in one growing user message so the cache breakpoint moves each turn). Diverges
+  safely to a fresh `session/new` + full history on prefix change (compression/edit), dead session, or
+  unkeyable conversation — never cross-talk. `_run_on_connection` was split into reusable
+  `_drain`/`_ensure_initialized`/`_open_new_session`/`_send_prompt`. ⚠️ MUTUALLY EXCLUSIVE with
+  `acp_disable_builtin_tools` (which passes `_meta.disableBuiltInTools`): dropping the engine's tools
+  removes the tools+system block prompt caching anchors on → T2b cache 100%→0%. Enable T2b alone.
+- **Latency reality** — ACP turn latency is **output-bound** (~50 tok/s; `latency ≈ 13s prompt + out/50`),
+  not thinking/context/cache. T2b makes the prompt side ~free but cannot speed up generation; the
+  user-facing floor is output length (e.g. `out=12699 → 266s`).
 - **ACP detection guards** — three sibling predicates that MUST all match the dispatch in
   `agent_runtime_helpers.create_openai_client` (`provider in (copilot-acp, claude-code-acp)`
   or `base_url` starts `acp://`): command-population + Responses-upgrade exclusion
