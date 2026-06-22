@@ -110,6 +110,39 @@ def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> 
     return base
 
 
+def build_memory_profile_block(agent: Any) -> str:
+    """Built-in memory snapshot + USER profile + external-memory block.
+
+    The memory/profile portion of the volatile tier, with the timestamp line
+    excluded. Shared by :func:`build_system_prompt_parts` (per-turn, for the
+    live agent) and by ``tools.delegate_tool``, which snapshots it into an
+    external ACP child's system prompt so delegated Claude Code agents inherit
+    the same memory + user profile the main session carries. Keep the assembly
+    here in sync with the volatile-tier section of build_system_prompt_parts.
+    """
+    parts: List[str] = []
+    store = getattr(agent, "_memory_store", None)
+    if store:
+        if getattr(agent, "_memory_enabled", False):
+            mem_block = store.format_for_system_prompt("memory")
+            if mem_block:
+                parts.append(mem_block)
+        # USER.md is always included when enabled.
+        if getattr(agent, "_user_profile_enabled", False):
+            user_block = store.format_for_system_prompt("user")
+            if user_block:
+                parts.append(user_block)
+    manager = getattr(agent, "_memory_manager", None)
+    if manager:
+        try:
+            ext_block = manager.build_system_prompt()
+            if ext_block:
+                parts.append(ext_block)
+        except Exception:
+            pass
+    return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered parts.
 
@@ -421,25 +454,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
-        if agent._memory_enabled:
-            mem_block = agent._memory_store.format_for_system_prompt("memory")
-            if mem_block:
-                volatile_parts.append(mem_block)
-        # USER.md is always included when enabled.
-        if agent._user_profile_enabled:
-            user_block = agent._memory_store.format_for_system_prompt("user")
-            if user_block:
-                volatile_parts.append(user_block)
-
-    # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
-        try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
-        except Exception:
-            pass
+    # Built-in memory snapshot + USER profile + external-memory block. Extracted
+    # into build_memory_profile_block so delegate_tool can inject the identical
+    # content into external ACP children. Joined as a single entry here, which is
+    # byte-identical to the prior per-block appends (all joined by "\n\n").
+    mem_profile_block = build_memory_profile_block(agent)
+    if mem_profile_block:
+        volatile_parts.append(mem_profile_block)
 
     from hermes_time import now as _hermes_now
     now = _hermes_now()

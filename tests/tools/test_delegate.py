@@ -14,6 +14,7 @@ import os
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -29,6 +30,7 @@ from tools.delegate_tool import (
     _build_child_progress_callback,
     _build_child_system_prompt,
     _extract_output_tail,
+    _maybe_inject_parent_memory,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -2793,6 +2795,138 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestACPChildMemoryInjection(unittest.TestCase):
+    """External ACP children (Claude Code over ACP) must inherit the parent's
+    memory + user profile; native subagents must not be affected."""
+
+    MEM_TOKEN = "MEMTOKEN_8f1c2a"
+    PROFILE_TOKEN = "PROFILETOKEN_3b9d4e"
+
+    def _make_memory_parent(self, *, acp_command):
+        """Real fake parent whose _memory_store exercises the genuine
+        build_memory_profile_block path (no mock of the formatter itself)."""
+
+        class _Store:
+            def format_for_system_prompt(_self, kind):
+                if kind == "memory":
+                    return f"# Persistent Memory\n\n{self.MEM_TOKEN}"
+                if kind == "user":
+                    return f"# User Profile\n\n{self.PROFILE_TOKEN}"
+                return ""
+
+        return SimpleNamespace(
+            _memory_store=_Store(),
+            _memory_enabled=True,
+            _user_profile_enabled=True,
+            _memory_manager=None,
+            acp_command=acp_command,
+        )
+
+    def test_external_acp_child_gets_memory_and_profile(self):
+        parent = self._make_memory_parent(acp_command="claude-code-acp")
+        out = _maybe_inject_parent_memory("BASE PROMPT", parent, is_external_acp=True)
+        self.assertIn("BASE PROMPT", out)
+        self.assertIn(self.MEM_TOKEN, out)
+        self.assertIn(self.PROFILE_TOKEN, out)
+
+    def test_native_child_unaffected(self):
+        parent = self._make_memory_parent(acp_command=None)
+        out = _maybe_inject_parent_memory("BASE PROMPT", parent, is_external_acp=False)
+        self.assertEqual(out, "BASE PROMPT")
+        self.assertNotIn(self.MEM_TOKEN, out)
+
+    def test_empty_parent_block_leaves_prompt_unchanged(self):
+        """A parent with memory disabled yields no block → no trailing noise."""
+        parent = SimpleNamespace(
+            _memory_enabled=False,
+            _user_profile_enabled=False,
+            _memory_manager=None,
+            acp_command="claude-code-acp",
+        )
+        out = _maybe_inject_parent_memory("BASE PROMPT", parent, is_external_acp=True)
+        self.assertEqual(out, "BASE PROMPT")
+
+    def test_build_child_agent_injects_for_acp_parent(self):
+        """End-to-end through _build_child_agent: an ACP-transport child's
+        ephemeral_system_prompt carries the parent's memory + profile."""
+        parent = self._make_memory_parent(acp_command="claude-code-acp")
+        # Fill in the rest of the attributes _build_child_agent reads.
+        parent.base_url = "acp://claude-code"
+        parent.api_key = "***"
+        parent.provider = "claude-code-acp"
+        parent.api_mode = "chat_completions"
+        parent.model = "claude-opus-4-8"
+        parent.platform = "feishu"
+        parent.acp_args = []
+        parent.providers_allowed = None
+        parent.providers_ignored = None
+        parent.providers_order = None
+        parent.provider_sort = None
+        parent._session_db = None
+        parent._delegate_depth = 0
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        parent._print_fn = None
+        parent.tool_progress_callback = None
+        parent.thinking_callback = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="implement feature",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        prompt = kwargs["ephemeral_system_prompt"]
+        self.assertIn(self.MEM_TOKEN, prompt)
+        self.assertIn(self.PROFILE_TOKEN, prompt)
+
+    def test_build_child_agent_no_injection_for_non_acp_parent(self):
+        """A non-ACP parent → child has no ACP transport → no memory injection."""
+        parent = self._make_memory_parent(acp_command=None)
+        parent.base_url = "https://openrouter.ai/api/v1"
+        parent.api_key = "***"
+        parent.provider = "openrouter"
+        parent.api_mode = "chat_completions"
+        parent.model = "anthropic/claude-sonnet-4"
+        parent.platform = "cli"
+        parent.acp_args = []
+        parent.providers_allowed = None
+        parent.providers_ignored = None
+        parent.providers_order = None
+        parent.provider_sort = None
+        parent._session_db = None
+        parent._delegate_depth = 0
+        parent._active_children = []
+        parent._active_children_lock = threading.Lock()
+        parent._print_fn = None
+        parent.tool_progress_callback = None
+        parent.thinking_callback = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="implement feature",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertNotIn(self.MEM_TOKEN, kwargs["ephemeral_system_prompt"])
 
 
 if __name__ == "__main__":

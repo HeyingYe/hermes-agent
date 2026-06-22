@@ -729,6 +729,40 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
+def _maybe_inject_parent_memory(
+    child_prompt: str,
+    parent_agent,
+    *,
+    is_external_acp: bool,
+) -> str:
+    """Append the parent's volatile memory/profile block to an external ACP child.
+
+    External ACP children (e.g. Claude Code over ACP) run in a separate process
+    and are constructed with ``skip_memory=True``, so they never build their own
+    volatile block. Per the operator requirement that external agents receive
+    Hermes memory + user profile, we snapshot the parent's volatile block — the
+    same MEMORY.md + USER profile + external-memory content the main session
+    injects per turn — at spawn time and append it to the child's system prompt.
+
+    Native Hermes subagents (no ACP transport) are intentionally unaffected: they
+    run memory-free by design. The timestamp is omitted because this is a
+    spawn-time snapshot, not a per-turn one. Returns ``child_prompt`` unchanged
+    when the child is not external-ACP or the parent exposes no memory/profile.
+    """
+    if not is_external_acp:
+        return child_prompt
+    try:
+        from agent.system_prompt import build_memory_profile_block
+
+        block = build_memory_profile_block(parent_agent)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("ACP child memory injection failed: %s", exc)
+        return child_prompt
+    if not block or not isinstance(block, str) or not block.strip():
+        return child_prompt
+    return f"{child_prompt}\n\n{block}"
+
+
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts.
 
@@ -1154,6 +1188,15 @@ def _build_child_agent(
     if override_provider and not override_acp_command:
         effective_acp_command = None
         effective_acp_args = []
+
+    # External ACP children (Claude Code over ACP) build no volatile block of
+    # their own (skip_memory=True). Inject the parent's memory + user profile so
+    # external agents inherit the same context the main session carries.
+    child_prompt = _maybe_inject_parent_memory(
+        child_prompt,
+        parent_agent,
+        is_external_acp=bool(effective_acp_command),
+    )
 
     if override_acp_command:
         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp

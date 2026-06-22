@@ -191,6 +191,14 @@ def _build_subprocess_env(command: str | None = None) -> dict[str, str]:
     # runs inside a Claude Code session; harmless for Copilot.
     for _nest in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
         env.pop(_nest, None)
+    # Force the spawned Claude Code session onto the OAuth subscription
+    # credential (~/.claude/.credentials.json claudeAiOauth) by stripping any
+    # ANTHROPIC_API_KEY we inherited. A non-empty key would silently flip every
+    # ACP turn to pay-per-token API billing — and these turns can carry >1M
+    # tokens. The intended billing path is the Claude subscription's included
+    # quota, so we never propagate an API key, even an empty one (its mere
+    # presence as "" is harmless today but removing it keeps intent explicit).
+    env.pop("ANTHROPIC_API_KEY", None)
     # The claude-agent-acp adapter (Agent SDK 0.3.x) bundles a per-arch `claude`
     # binary and prefers it; under an x64-Rosetta node the bundled darwin-x64
     # binary hangs. Pin the adapter to a known-good native `claude` via
