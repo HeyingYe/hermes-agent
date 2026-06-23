@@ -502,6 +502,19 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
   `acquire_scoped_lock()` (`gateway/status.py`) in `connect()`/`start()` and
   `release_scoped_lock()` in `disconnect()` — prevents two profiles using the same
   bot token. Canonical pattern: `gateway/platforms/telegram.py`.
+- **Feishu DM task isolation (2026-06-23, gated `feishu.dm_task_mode`, default OFF).**
+  Goal "每任务一卡一会话，闲聊秒回": a top-level actionable DM message is spun off
+  into its own thread + session and runs **concurrently** with siblings (race-free,
+  because each thread is its own session); chit-chat falls through to normal inline
+  handling. Pieces: `gateway/dm_task_router.py` (pure heuristic `classify_dm_message`
+  → task|chitchat|ambiguous); `feishu.py::_handle_message_with_guards` intercepts top-
+  level DM tasks → `_run_dm_task` (open thread via `send(reply_to=msg_id,
+  metadata={thread_id})`, then re-enter `handle_message` on a thread-scoped
+  `dataclasses.replace` clone with a **fresh message_id** so the dedup cache doesn't
+  drop it); the per-chat lock keys on `(chat_id, thread_id)` so sibling threads run in
+  parallel; `thread_sessions_per_user` defaults to `dm_task_mode`. Kanban card creation
+  is a further sub-flag `dm_task_create_card` (default OFF — avoids the dispatcher
+  double-running the card the gateway already executes). Flag off ⇒ strict no-op.
 - **Background-process notifications:** `terminal(background=true,
   notify_on_complete=true)` arms a watcher that, on completion, triggers a new agent
   turn. Verbosity: `display.background_process_notifications` (all/result/error/off).

@@ -84,3 +84,53 @@ def test_needs_aux():
     assert needs_aux(amb, mode="heuristic+aux") is True
     assert needs_aux(amb, mode="heuristic") is False
     assert needs_aux(task, mode="heuristic+aux") is False
+
+
+# ── FeishuAdapter._dm_task_should_spawn gate (no full adapter needed) ──────────
+def _gate(classify="heuristic"):
+    from types import SimpleNamespace
+    from gateway.platforms.feishu import FeishuAdapter
+    return FeishuAdapter._dm_task_should_spawn.__get__(
+        SimpleNamespace(_dm_task_classify=classify)
+    )
+
+
+def _event(text, *, chat_type="dm", mid="om_1", command=False):
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    src = SessionSource(platform=Platform.FEISHU, chat_id="oc_1", chat_type=chat_type, message_id=mid)
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.COMMAND if command else MessageType.TEXT,
+        source=src,
+        message_id=mid,
+    )
+
+
+def test_gate_task_in_dm_spawns():
+    assert _gate()(_event("帮我生成一份周报并推送给我")) is True
+
+
+def test_gate_chitchat_in_dm_does_not_spawn():
+    assert _gate()(_event("谢谢")) is False
+
+
+def test_gate_group_excluded():
+    assert _gate()(_event("帮我生成一份周报", chat_type="group")) is False
+
+
+def test_gate_command_excluded():
+    assert _gate()(_event("/new")) is False
+
+
+def test_gate_nontext_excluded():
+    assert _gate()(_event("帮我生成一份周报", command=True)) is False
+
+
+def test_gate_missing_message_id_excluded():
+    assert _gate()(_event("帮我生成一份周报", mid=None)) is False
+
+
+def test_gate_all_tasks_mode_spawns_chitchat_too():
+    assert _gate(classify="all-tasks")(_event("谢谢")) is True

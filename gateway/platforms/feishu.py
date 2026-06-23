@@ -1606,6 +1606,12 @@ class FeishuAdapter(BasePlatformAdapter):
             self._dm_max_parallel_tasks = max(1, int((self.config.extra or {}).get("dm_max_parallel_tasks", 3)))
         except Exception:
             self._dm_max_parallel_tasks = 3
+        # Create a Kanban card per isolated task. Default OFF: the kanban
+        # dispatcher could otherwise pick up the card and run the task a SECOND
+        # time (the gateway already runs it in the thread session). Enable only
+        # after confirming the dispatcher won't double-execute unassigned cards.
+        self._dm_task_create_card = bool((self.config.extra or {}).get("dm_task_create_card", False))
+        self._dm_task_semaphore: "Optional[asyncio.Semaphore]" = None  # lazy (needs a loop)
         self._webhook_host = settings.webhook_host
         self._webhook_port = settings.webhook_port
         self._webhook_path = settings.webhook_path
@@ -2948,10 +2954,122 @@ class FeishuAdapter(BasePlatformAdapter):
         # thread — an isolated task session — runs in parallel with sibling threads.
         # Safe only because dm_task_mode also gives each thread its own session.
         thread_id = (getattr(event.source, "thread_id", "") or "") if event.source else ""
+        # DM task isolation: a top-level actionable DM task is spun off into its own
+        # thread + session (concurrent, race-free) so sibling tasks don't block each
+        # other; chit-chat falls through to normal inline handling on the main DM
+        # session. Gated by dm_task_mode (default off → strict no-op).
+        if self._dm_task_mode and not thread_id and self._dm_task_should_spawn(event):
+            asyncio.create_task(self._run_dm_task(event))
+            return
         lock_key = f"{chat_id}\x1f{thread_id}" if (self._dm_task_mode and thread_id) else chat_id
         chat_lock = self._get_chat_lock(lock_key)
         async with chat_lock:
             await self.handle_message(event)
+
+    # =========================================================================
+    # DM task isolation (spec: 每任务一卡一会话，闲聊秒回) — gated by dm_task_mode
+    # =========================================================================
+
+    def _dm_task_should_spawn(self, event: MessageEvent) -> bool:
+        """True iff this top-level DM message is an actionable task to isolate.
+
+        Pure + cheap (heuristic classifier). Commands, reactions, non-text and
+        chit-chat fall through to normal inline handling. Requires a message_id
+        (used as the thread anchor).
+        """
+        try:
+            src = getattr(event, "source", None)
+            if not src or getattr(src, "chat_type", "") != "dm":
+                return False
+            if getattr(event, "message_type", None) != MessageType.TEXT:
+                return False
+            text = (getattr(event, "text", "") or "").strip()
+            if not text or text.startswith("/"):
+                return False
+            if not getattr(event, "message_id", None):
+                return False
+            from gateway.dm_task_router import classify_dm_message, resolve_label
+            routed = None
+            try:
+                from hermes_cli.jarvis import infer_profile_and_route
+                routed = infer_profile_and_route(text)
+            except Exception:
+                routed = None
+            result = classify_dm_message(text, routed=routed)
+            return resolve_label(result, mode=self._dm_task_classify) == "task"
+        except Exception:
+            logger.debug("[Feishu] _dm_task_should_spawn failed", exc_info=True)
+            return False
+
+    async def _run_dm_task(self, event: MessageEvent) -> None:
+        """Isolate an actionable DM task: (optional card) + open thread + run the
+        full pipeline in the thread's own session, concurrently with siblings.
+
+        Reuses ``handle_message`` so batching/session/agent-run/reply all behave
+        normally — only the source is thread-scoped and the message_id is fresh
+        (so the dedup cache, which already saw the original id, doesn't drop it).
+        """
+        import dataclasses
+        if self._dm_task_semaphore is None:
+            self._dm_task_semaphore = asyncio.Semaphore(self._dm_max_parallel_tasks)
+        chat_id = (getattr(event.source, "chat_id", "") or "") if event.source else ""
+        root_id = getattr(event, "message_id", "") or ""
+        thread_meta = {"thread_id": root_id, "reply_to_message_id": root_id}
+        async with self._dm_task_semaphore:
+            task_id = None
+            if self._dm_task_create_card:
+                try:
+                    task_id = await asyncio.to_thread(self._create_dm_kanban_task, event)
+                except Exception:
+                    logger.debug("[Feishu] dm task: kanban card creation failed", exc_info=True)
+            # Open the thread with a short ack (reply in-thread to the trigger).
+            try:
+                ack = "✅ 已受理，正在独立处理" + (f"（任务 {task_id}）" if task_id else "") + "，进度见本话题。"
+                await self.send(chat_id, ack, reply_to=root_id, metadata=dict(thread_meta))
+            except Exception:
+                logger.debug("[Feishu] dm task: thread ack failed", exc_info=True)
+            # Run the full pipeline in the thread's own session.
+            try:
+                thread_source = dataclasses.replace(event.source, thread_id=root_id)
+                thread_event = dataclasses.replace(
+                    event,
+                    source=thread_source,
+                    message_id=f"{root_id}:dmtask",
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                )
+                async with self._get_chat_lock(f"{chat_id}\x1f{root_id}"):
+                    await self.handle_message(thread_event)
+            except Exception:
+                logger.error("[Feishu] dm task execution failed (root=%s)", root_id, exc_info=True)
+                try:
+                    await self.send(chat_id, "⚠️ 任务执行出错，请重试或换种说法。",
+                                    reply_to=root_id, metadata=dict(thread_meta))
+                except Exception:
+                    pass
+
+    def _create_dm_kanban_task(self, event: MessageEvent) -> Optional[str]:
+        """Best-effort Kanban card for a DM task (visibility). Sync; runs in a
+        thread. Status 'running' so the dispatcher treats it as already in-flight.
+        """
+        from hermes_cli import kanban_db as kb
+        text = (getattr(event, "text", "") or "").strip()
+        title = (text[:80] + ("…" if len(text) > 80 else "")) or "Feishu DM task"
+        conn = kb.connect(board=None)
+        try:
+            return kb.create_task(
+                conn,
+                title=title,
+                body=text,
+                assignee=None,
+                created_by="feishu-dm",
+                initial_status="running",
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     # =========================================================================
     # Processing status reactions
