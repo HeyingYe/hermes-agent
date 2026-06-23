@@ -1806,6 +1806,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
+        # Jarvis DM task isolation (spec: 每任务一卡一会话，闲聊秒回). Behavioral flags,
+        # consistent with the env-driven Feishu config here. All default OFF/unset →
+        # the adapter falls back to its own safe defaults (dm_task_mode=False).
+        if os.getenv("FEISHU_DM_TASK_MODE", "").strip():
+            config.platforms[Platform.FEISHU].extra["dm_task_mode"] = (
+                os.getenv("FEISHU_DM_TASK_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+            )
+        if os.getenv("FEISHU_DM_TASK_CLASSIFY", "").strip():
+            config.platforms[Platform.FEISHU].extra["dm_task_classify"] = os.getenv("FEISHU_DM_TASK_CLASSIFY").strip()
+        if os.getenv("FEISHU_DM_MAX_PARALLEL_TASKS", "").strip():
+            config.platforms[Platform.FEISHU].extra["dm_max_parallel_tasks"] = os.getenv("FEISHU_DM_MAX_PARALLEL_TASKS").strip()
+        if os.getenv("FEISHU_DM_TASK_CREATE_CARD", "").strip():
+            config.platforms[Platform.FEISHU].extra["dm_task_create_card"] = (
+                os.getenv("FEISHU_DM_TASK_CREATE_CARD", "").strip().lower() in ("1", "true", "yes", "on")
+            )
         feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
         if feishu_home:
             config.platforms[Platform.FEISHU].home_channel = HomeChannel(
