@@ -3030,12 +3030,18 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.debug("[Feishu] dm task: thread ack failed", exc_info=True)
             # Run the full pipeline in the thread's own session.
             try:
+                # Re-enter handle_message directly (it does NOT re-run dedup — dedup
+                # is checked once at reception, _is_duplicate, before the guards). So
+                # keep the REAL message_id: a synthetic id (e.g. "<id>:dmtask") leaks
+                # into the Feishu reply anchor and the reply API rejects it
+                # ([99992354] invalid open_message_id). reply_to_message_id=root_id
+                # anchors the agent's reply in-thread on the real trigger message.
                 thread_source = dataclasses.replace(event.source, thread_id=root_id)
                 thread_event = dataclasses.replace(
                     event,
                     source=thread_source,
-                    message_id=f"{root_id}:dmtask",
-                    reply_to_message_id=None,
+                    message_id=root_id,
+                    reply_to_message_id=root_id,
                     reply_to_text=None,
                 )
                 async with self._get_chat_lock(f"{chat_id}\x1f{root_id}"):
