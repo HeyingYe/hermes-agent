@@ -1598,6 +1598,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._text_batch_max_messages = settings.text_batch_max_messages
         self._text_batch_max_chars = settings.text_batch_max_chars
         self._media_batch_delay_seconds = settings.media_batch_delay_seconds
+        # Jarvis DM task isolation (spec: 每任务一卡一会话，闲聊秒回). Free-form
+        # config.extra flags; default OFF → strict no-op (no behavior change).
+        self._dm_task_mode = bool((self.config.extra or {}).get("dm_task_mode", False))
+        self._dm_task_classify = str((self.config.extra or {}).get("dm_task_classify", "heuristic+aux"))
+        try:
+            self._dm_max_parallel_tasks = max(1, int((self.config.extra or {}).get("dm_max_parallel_tasks", 3)))
+        except Exception:
+            self._dm_max_parallel_tasks = 3
         self._webhook_host = settings.webhook_host
         self._webhook_port = settings.webhook_port
         self._webhook_path = settings.webhook_path
@@ -2935,7 +2943,13 @@ class FeishuAdapter(BasePlatformAdapter):
         time (matches openclaw's createChatQueue serial queue behaviour).
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
-        chat_lock = self._get_chat_lock(chat_id)
+        # When DM task isolation is on, serialize per (chat, thread) instead of per
+        # chat: top-level messages (no thread_id) still serialize per chat, but each
+        # thread — an isolated task session — runs in parallel with sibling threads.
+        # Safe only because dm_task_mode also gives each thread its own session.
+        thread_id = (getattr(event.source, "thread_id", "") or "") if event.source else ""
+        lock_key = f"{chat_id}\x1f{thread_id}" if (self._dm_task_mode and thread_id) else chat_id
+        chat_lock = self._get_chat_lock(lock_key)
         async with chat_lock:
             await self.handle_message(event)
 
@@ -3202,7 +3216,7 @@ class FeishuAdapter(BasePlatformAdapter):
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", self._dm_task_mode),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3491,7 +3505,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", self._dm_task_mode),
         )
 
     @staticmethod
