@@ -318,6 +318,21 @@ trajectory-only and stripped before send.
 
 ### Jarvis token-maximization: subscription routing + warm ACP pool
 
+> **⚠️ DISABLED BY DECISION (2026-06-23): `route_decision.enabled=false`.** Driving Claude
+> *as the chat backend* over ACP was found to be the key cause of "Jarvis got dumber":
+> `copilot_acp_client._format_messages_as_prompt` **flattens** Hermes's structured request
+> (real system prompt + role-separated messages + native tool schemas) into a single TEXT
+> blob delivered as a user turn inside Claude Code's own harness — so the model runs under
+> CC's system prompt, sees tools as *text* it must hand-emit as `<tool_call>` JSON (→ "tool
+> call could not be parsed", 0 such failures on the native gpt-5.5 path), and loses role
+> structure + prompt caching. Decision: **main/cron/bg-review run the gpt-5.5 native loop**
+> (real brain, fast); **Claude Code is used only as an explicit coding tool** (HERMES_HOME
+> skill `code-with-claude` → headless `claude -p` with CC's *own* native tools, which is its
+> strength and still spends the subscription). The included weekly quota can only be consumed
+> via Claude Code/ACP, so "fill the free quota" and "answer quality" are in fundamental
+> tension — resolved by spending it on real coding, not on flattened chat turns. The ACP
+> machinery below remains in-tree but **dormant** (single flag re-enables it).
+
 The "fill the paid quota" layer (spec `~/jarvis-ops/docs/jarvis-token-maximization-spec.md`,
 branch `feat/jarvis-token-max`) rides on top of the provider system as **internal modules
 + config**, invisible to the model (no new core tool, no schema/system-prompt change):
