@@ -120,6 +120,77 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
         conn.close()
 
 
+def test_auto_block_creates_self_repair_task(kanban_home, all_assignees_spawnable):
+    """A blocking task failure should create an immediate repair card."""
+    def _bad_spawn(task, ws):
+        raise RuntimeError("missing binary: hermes-worker")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="run nightly sync",
+            assignee="worker",
+            priority=7,
+            tenant="ops",
+        )
+
+        kb.dispatch_once(conn, spawn_fn=_bad_spawn)
+        result = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
+
+        assert tid in result.auto_blocked
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE created_by = 'kanban-self-repair'"
+        ).fetchall()
+        assert len(rows) == 1
+        repair = kb.Task.from_row(rows[0])
+        assert repair.status == "ready"
+        assert repair.assignee == "default"
+        assert repair.tenant == "ops"
+        assert repair.priority == 107
+        assert repair.max_retries == 1
+        assert repair.skills == ["systematic-debugging"]
+        assert repair.idempotency_key is not None
+        assert repair.idempotency_key.startswith(
+            f"{kb.SELF_REPAIR_IDEMPOTENCY_PREFIX}:{tid}:blocking:"
+        )
+        assert "run nightly sync" in (repair.body or "")
+        assert "missing binary: hermes-worker" in (repair.body or "")
+        assert '"source_task_id"' in (repair.body or "")
+
+        source_events = kb.list_events(conn, tid)
+        assert any(e.kind == "self_repair_task_created" for e in source_events)
+        repair_events = kb.list_events(conn, repair.id)
+        assert any(e.kind == "self_repair_source" for e in repair_events)
+    finally:
+        conn.close()
+
+
+def test_self_repair_task_is_idempotent(kanban_home, all_assignees_spawnable):
+    """Repeated gave_up events with the same fingerprint reuse one card."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="flaky", assignee="worker", max_retries=1)
+        for _ in range(2):
+            kb.claim_task(conn, tid)
+            assert kb._record_task_failure(
+                conn,
+                tid,
+                error="same infra error",
+                outcome="spawn_failed",
+                release_claim=True,
+                end_run=True,
+            ) is True
+            kb.promote_task(conn, tid, actor="test", force=True)
+
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = 'kanban-self-repair'"
+        ).fetchall()
+        assert len(rows) == 1
+    finally:
+        conn.close()
+
+
 def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assignees_spawnable):
     """Under unified consecutive-failure counting, a successful spawn
     does NOT reset the counter — past failures stay on the books until

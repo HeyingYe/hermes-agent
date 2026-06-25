@@ -2369,6 +2369,14 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Automatically create a high-priority Kanban repair task when a
+        # worker failure trips the circuit breaker. Blocking failures are
+        # routed to a ready task immediately; future non-blocking warnings can
+        # reuse the same machinery with scheduled/blocked status.
+        "self_repair_enabled": True,
+        # Profile that owns auto-created repair cards. Empty means fall back to
+        # kanban.default_assignee, then the default profile.
+        "self_repair_assignee": "",
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

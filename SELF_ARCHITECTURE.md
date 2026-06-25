@@ -195,7 +195,7 @@ trajectory-only and stripped before send.
 | Symptom | Start here |
 |---|---|
 | Loop control / iteration logic | `agent/conversation_loop.py` `run_conversation()` |
-| Budget exhausts too early/late | `agent/iteration_budget.py` + loop guard |
+| Budget exhausts too early/late | `agent/iteration_budget.py` + `agent/token_budget.py` + loop guard. `TokenBudget.breach()` is **per-turn only**; session cumulative prompt tokens are telemetry/cost data and must not freeze a valid long conversation. |
 | Interrupt / `/stop` ignored | interrupt check at top of loop; gateway `interrupt()` |
 | System prompt wrong / cache misses | `agent/system_prompt.py:113` (tier boundaries) |
 | Tool calls not executing | `_execute_tool_calls` (`run_agent.py:5157`) + `agent/tool_executor.py` dispatch |
@@ -592,13 +592,21 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 
 ### A. Context compression  (`agent/context_compressor.py`, `context_engine.py`, `conversation_compression.py`, `trajectory_compressor.py`)
 
-- `should_compress()` checks prompt-token pressure against a threshold (default ~75%
-  of the window). `compress()` summarizes middle turns via the **auxiliary** model,
-  preserving the system prompt and recent turns, and **rotates the session id**.
+- `should_compress()` checks **current request prompt-token pressure** against a
+  threshold (default 50% of the configured/model context window, with a minimum floor).
+  It must not use session cumulative prompt tokens: cumulative tokens grow with useful
+  long-running work and are cost/latency telemetry, not a context-health signal.
+- `compress()` summarizes middle turns via the **auxiliary** model, preserves the system
+  prompt and recent tail, prunes historical tool results before summarization, and
+  **rotates the session id** through `conversation_compression.compress_context()`.
 - Cache-safe because earlier messages are never mutated in place — compression is the
   *one* sanctioned context rewrite. After it, providers get
   `on_session_switch(parent_session_id=...)`. Tool-call/result pairs are kept balanced
   (`_sanitize_tool_pairs`) so the API never sees an orphaned `tool_call`.
+- `TokenBudget` is separate from compression: it guards repeated large API calls **within
+  a single turn** (`per_turn_prompt_tokens`). `session_used` remains available for usage
+  dashboards/diagnostics, but `per_session_prompt_tokens` is compatibility telemetry and
+  must not produce `token_budget_exhausted:per_session`.
 
 ### B. Memory  (`agent/memory_manager.py`, `memory_provider.py`, `tools/memory_tool.py`, `plugins/memory/*`)
 
@@ -696,9 +704,13 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
   host-local still-alive workers get a short reclaim deferral to avoid duplicate
   spawns. Non-success outcomes now funnel through `_record_task_failure()` so
   spawn-failed, crashed, and timed-out runs share `consecutive_failures`; per-task
-  `max_retries` overrides `kanban.failure_limit` / `DEFAULT_FAILURE_LIMIT`. Worker exit
-  code `75` (`KANBAN_RATE_LIMIT_EXIT_CODE`) is classified as `rate_limited`, requeued
-  without incrementing the failure counter.
+  `max_retries` overrides `kanban.failure_limit` / `DEFAULT_FAILURE_LIMIT`. When the
+  circuit breaker trips, `_ensure_self_repair_task()` creates an idempotent high-priority
+  Kanban repair card (`created_by='kanban-self-repair'`) carrying the source task,
+  error, failure count, and workspace context; blocking failures land in `ready` for
+  immediate dispatch, while the same helper can park future non-blocking warnings as
+  delayed/blocked repair work. Worker exit code `75` (`KANBAN_RATE_LIMIT_EXIT_CODE`) is
+  classified as `rate_limited`, requeued without incrementing the failure counter.
   Site-local watchdogs can live under `$HERMES_HOME/scripts/` rather than this repo:
   e.g. `jarvis_kanban_completion_idle_retry.py` is a cron `no_agent` notifier/retry
   script. For bad completion notification titles, inspect both `tasks.title/body` and

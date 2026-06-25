@@ -6118,6 +6118,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    repair_context: Optional[dict[str, Any]] = None
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries "
@@ -6187,6 +6188,15 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            repair_context = {
+                "source_task_id": task_id,
+                "error": error,
+                "outcome": outcome,
+                "failures": failures,
+                "effective_limit": effective_limit,
+                "severity": "blocking",
+                "event_payload": dict(payload),
+            }
             blocked = True
         else:
             # Below threshold.
@@ -6221,6 +6231,15 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    if repair_context:
+        try:
+            _ensure_self_repair_task(conn, **repair_context)
+        except Exception:
+            _log.debug(
+                "kanban self-repair: failed to create repair task for %s",
+                task_id,
+                exc_info=True,
+            )
     return blocked
 
 
