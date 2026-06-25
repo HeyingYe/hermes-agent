@@ -148,7 +148,15 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage",
+    "todo",
+    "blocked-by-deps",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+    "done",
 ]
 
 
@@ -371,6 +379,55 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
     return {"parents": parents, "children": children}
 
 
+def _task_preview(row: sqlite3.Row) -> dict[str, Any]:
+    """Compact related-task preview safe for board cards."""
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "status": row["status"],
+        "assignee": row["assignee"],
+    }
+
+
+def _relationship_previews_for_board(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Return parent/child task previews for visible board cards.
+
+    The dashboard card already shows relationship counts, but counts alone make
+    decomposed subtasks look detached from the user's original task. Build this
+    in two bulk queries so the board endpoint can show lineage without N+1
+    detail fetches.
+    """
+    previews: dict[str, dict[str, list[dict[str, Any]]]] = {
+        task_id: {"parents": [], "children": []} for task_id in task_ids
+    }
+    if not task_ids:
+        return previews
+
+    placeholders = ",".join(["?"] * len(task_ids))
+    for row in conn.execute(
+        "SELECT l.child_id AS task_id, p.id, p.title, p.status, p.assignee "
+        "FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        f"WHERE l.child_id IN ({placeholders}) "
+        "ORDER BY l.child_id, p.created_at, p.id",
+        tuple(task_ids),
+    ).fetchall():
+        previews[row["task_id"]]["parents"].append(_task_preview(row))
+
+    for row in conn.execute(
+        "SELECT l.parent_id AS task_id, c.id, c.title, c.status, c.assignee "
+        "FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        f"WHERE l.parent_id IN ({placeholders}) "
+        "ORDER BY l.parent_id, c.created_at, c.id",
+        tuple(task_ids),
+    ).fetchall():
+        previews[row["task_id"]]["children"].append(_task_preview(row))
+
+    return previews
+
+
 # ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
@@ -453,11 +510,14 @@ def get_board(
         if include_archived:
             columns["archived"] = []
 
+        task_ids = [t.id for t in tasks]
+        relationship_previews = _relationship_previews_for_board(conn, task_ids)
+
         # Batch-fetch the latest non-null run summary per task in one
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -466,6 +526,10 @@ def get_board(
             )
             d = _task_dict(t, latest_summary=preview)
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+            d["relationships"] = relationship_previews.get(
+                t.id,
+                {"parents": [], "children": []},
+            )
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             diags = diagnostics_per_task.get(t.id)
@@ -1053,7 +1117,7 @@ def _set_status_direct(
             ).fetchall():
                 child_id = row["child_id"]
                 demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
+                    "UPDATE tasks SET status = 'blocked-by-deps' "
                     "WHERE id = ? AND status = 'ready'",
                     (child_id,),
                 )
@@ -1065,7 +1129,7 @@ def _set_status_direct(
                             child_id,
                             json.dumps(
                                 {
-                                    "status": "todo",
+                                    "status": "blocked-by-deps",
                                     "reason": "parent_reopened",
                                     "parent": task_id,
                                 }

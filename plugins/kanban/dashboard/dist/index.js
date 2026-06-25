@@ -87,25 +87,31 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "blocked-by-deps", "scheduled", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    "blocked-by-deps": "Blocked by Deps",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    review: "Review",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
+    todo: "Backlog tasks not ready for dispatch yet",
+    "blocked-by-deps": "Waiting for parent tasks to complete",
+    scheduled: "Time-based follow-ups waiting for their scheduled time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    review: "Worker finished but needs review or a final decision",
     done: "Completed",
     archived: "Archived",
   };
@@ -154,9 +160,12 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    "blocked-by-deps": "hermes-kanban-dot-blocked-by-deps",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -2489,6 +2498,11 @@
 
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
+    const relationships = t.relationships || { parents: [], children: [] };
+    const parentPreviews = relationships.parents || [];
+    const childPreviews = relationships.children || [];
+    const firstParent = parentPreviews[0];
+    const firstChild = childPreviews[0];
 
     return h("div", {
       ref: cardRef,
@@ -2568,6 +2582,33 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          firstParent
+            ? h("div", {
+                className: "hermes-kanban-card-relation hermes-kanban-card-relation--parent",
+                title: `Parent task ${firstParent.id}: ${firstParent.title || "(untitled)"}`,
+              },
+                h("span", { className: "hermes-kanban-card-relation-label" },
+                  tx(i18n, "parentTask", "Parent")),
+                h("code", { className: "hermes-kanban-card-relation-id" }, firstParent.id),
+                h("span", { className: "hermes-kanban-card-relation-title" },
+                  firstParent.title || tx(i18n, "untitled", "(untitled)")),
+              )
+            : null,
+          childPreviews.length > 0
+            ? h("div", {
+                className: "hermes-kanban-card-relation hermes-kanban-card-relation--children",
+                title: firstChild
+                  ? `First child ${firstChild.id}: ${firstChild.title || "(untitled)"}`
+                  : "Child tasks",
+              },
+                h("span", { className: "hermes-kanban-card-relation-label" },
+                  tx(i18n, "childTasks", "Children")),
+                h("span", { className: "hermes-kanban-card-relation-title" },
+                  childPreviews.length === 1
+                    ? `${firstChild.id} — ${firstChild.title || tx(i18n, "untitled", "(untitled)")}`
+                    : `${childPreviews.length} tasks · ${firstChild.id} — ${firstChild.title || tx(i18n, "untitled", "(untitled)")}`),
+              )
+            : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",

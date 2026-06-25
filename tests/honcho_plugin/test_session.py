@@ -1346,24 +1346,65 @@ class TestSessionStartDialecticPrewarm:
         # The sync first-turn path must NOT have fired another .chat()
         assert p._manager.dialectic_query.call_count == 0
 
-    def test_turn1_falls_back_to_sync_when_prewarm_missing(self):
-        """If the prewarm produced nothing (empty graph, API blip), turn 1
-        still fires its own sync dialectic."""
+    def test_turn1_skips_sync_dialectic_when_prewarm_missing(self):
+        """If prewarm produced nothing (empty graph, API blip), turn 1 must
+        not call peer.chat() inline. Dialectic retries are background-only via
+        queue_prefetch(), so the current turn returns fast with base context
+        only."""
         p = self._make_provider(dialectic_result="")  # prewarm returns empty
         if p._prefetch_thread:
             p._prefetch_thread.join(timeout=3.0)
         with p._prefetch_lock:
             assert p._prefetch_result == ""  # prewarm landed nothing
-        # Switch dialectic_query to return something on the sync first-turn call
-        p._manager.dialectic_query.return_value = "sync recovery"
+        p._manager.dialectic_query.return_value = "would block if called inline"
         p._manager.dialectic_query.reset_mock()
         p._session_key = "test-prewarm"
         p._base_context_cache = ""
         p._turn_count = 1
 
         result = p.prefetch("hello world")
-        assert "sync recovery" in result
-        assert p._manager.dialectic_query.call_count == 1
+        assert result == ""
+        assert p._manager.dialectic_query.call_count == 0
+
+    def test_turn1_does_not_wait_for_running_dialectic_thread(self):
+        """An in-flight prewarm/queue_prefetch dialectic thread must not be
+        joined from prefetch(); it should surface on a later turn if it lands."""
+        import threading as _threading
+        import time as _time
+
+        p = self._make_provider(dialectic_result="")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=3.0)
+        p._manager.dialectic_query.reset_mock()
+        p._session_key = "test-prewarm"
+        p._base_context_cache = ""
+        p._turn_count = 1
+        p._last_dialectic_turn = -999
+
+        hold = _threading.Event()
+        started = _threading.Event()
+
+        def _block():
+            started.set()
+            hold.wait(timeout=5.0)
+
+        running = _threading.Thread(target=_block, daemon=True)
+        running.start()
+        assert started.wait(timeout=1.0)
+        p._prefetch_thread = running
+        p._prefetch_thread_started_at = _time.monotonic()
+
+        start = _time.perf_counter()
+        try:
+            result = p.prefetch("hello world")
+            elapsed = _time.perf_counter() - start
+            assert result == ""
+            assert elapsed < 0.5
+            assert running.is_alive(), "prefetch() must not join in-flight dialectic"
+            assert p._manager.dialectic_query.call_count == 0
+        finally:
+            hold.set()
+            running.join(timeout=1.0)
 
 
 class TestDialecticLiveness:

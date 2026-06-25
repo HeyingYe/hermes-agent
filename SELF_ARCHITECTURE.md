@@ -13,9 +13,9 @@
 > file does not repeat the rubric.
 >
 > **How to use the pointers.** Every pointer is `file:line` *relative to the repo
-> root* (`~/.hermes/hermes-agent/`). **Line numbers drift — function and class
+> root* (`$HERMES_HOME/hermes-agent/`, currently `~/Jarvis/.hermes/hermes-agent/`). **Line numbers drift — function and class
 > names do not.** Always navigate by the named symbol; treat the line number as a
-> hint, not a contract. Snapshot taken **2026-06-21** against the working checkout.
+> hint, not a contract. Snapshot refreshed **2026-06-23** against the working checkout.
 > The canonical source is always the filesystem — when a pointer is stale, re-grep
 > for the symbol name.
 
@@ -71,15 +71,17 @@ history; extracting clusters out of them into modules is *welcome* work — see
 | File / dir | LOC | Owns |
 |---|---|---|
 | `run_agent.py` | ~5.5k | `AIAgent` class — construction, the public `chat()`/`run_conversation()`, tool-call execution routing (`_execute_tool_calls`) |
-| `agent/conversation_loop.py` | ~4.5k | **The actual tool-calling loop body** (`run_conversation()` lives here; `run_agent.py` forwards to it) |
+| `agent/conversation_loop.py` | ~4.6k | **The actual tool-calling loop body** (`run_conversation()` lives here; `run_agent.py` forwards to it) |
+| `agent/tool_executor.py` | ~1.4k | Sequential/concurrent tool-call execution helpers extracted from the loop; inline agent-runtime tools + hook emission + guardrail/file-mutation tracking |
+| `agent/turn_finalizer.py` | ~430 | Post-loop finalization: budget-exhaustion summary, trajectory/session persistence, turn diagnostics, response transforms, memory/skill review trigger |
 | `agent/system_prompt.py` | — | System-prompt assembly (`build_system_prompt_parts`, `build_system_prompt`) — the 3-tier cache structure |
 | `model_tools.py` | ~1.2k | Tool orchestration: `discover_builtin_tools()`, `get_tool_definitions()`, `handle_function_call()` |
 | `tools/registry.py` | ~590 | `ToolRegistry` singleton (`registry`), `register()`, auto-discovery |
 | `toolsets.py` | ~900 | `TOOLSETS` dict, `_HERMES_CORE_TOOLS`, `resolve_toolset()` |
 | `tools/*.py` | ~87 files | Individual tool implementations (self-register at import) |
 | `cli.py` | ~15k | `HermesCLI` — interactive CLI orchestrator, `process_command()` |
-| `hermes_cli/` | ~129 files | CLI subcommands, setup wizard, config, plugins loader, skin engine, kanban/curator CLIs |
-| `gateway/` | ~36 files | Messaging gateway: `run.py` (runner), `session.py`, `status.py`, `platforms/` |
+| `hermes_cli/` | ~129 files | CLI subcommands, setup wizard, config, plugins loader, skin engine, kanban/curator CLIs; `kanban_db.py` is the multi-board CAS/WAL coordination layer |
+| `gateway/` | ~36 files | Messaging gateway: `run.py` (runner, session runtime, empty-response normalization), `session.py`, `status.py`, `platforms/` |
 | `hermes_state.py` | ~5k | `SessionDB` — SQLite session+message store with FTS5 search |
 | `hermes_constants.py` | — | `get_hermes_home()`, `display_hermes_home()` — **profile-aware paths** |
 | `hermes_logging.py` | — | `setup_logging()` — `agent.log` / `errors.log` / `gateway.log` |
@@ -119,8 +121,11 @@ history; extracting clusters out of them into modules is *welcome* work — see
    │          compress context / shrink image (error_classifier.py)          │
    │    5. parse assistant msg + finish_reason                               │
    │    6. if tool_calls: validate names/args → _execute_tool_calls()        │
-   │            (sequential or concurrent) → append tool results → continue  │
-   │       else: extract final response → return                             │
+   │            (agent/tool_executor.py sequential or concurrent) → append   │
+   │            tool results + drain /steer → continue                       │
+   │       else: extract final response                                      │
+   │    7. finalize_turn(): persist, explain abnormal exits, run hooks,      │
+   │       sync memory, possibly spawn bg memory/skill review                │
    └─────────────────────────────────────────────────────────────────────────┘
                                ▼
                   final response string → surface
@@ -144,7 +149,8 @@ trajectory-only and stripped before send.
 | `chat(message)` — simple, returns final string | `run_agent.py:5282` |
 | `run_conversation(...)` — full, forwards to loop | `run_agent.py:5259` |
 | **The loop body** — `run_conversation()` | `agent/conversation_loop.py` |
-| Tool-call execution router (seq vs concurrent) | `run_agent.py:5157` (`_execute_tool_calls`) → `:5244` concurrent / `:5249` sequential |
+| Tool-call execution router (seq vs concurrent) | `run_agent.py:5157` (`_execute_tool_calls`) → `agent/tool_executor.py` (`execute_tool_calls_concurrent`, `execute_tool_calls_sequential`) |
+| Post-loop finalization | `agent/turn_finalizer.py` (`finalize_turn`) |
 | Iteration budget | `agent/iteration_budget.py` (`.consume()` / `.refund()` / `.remaining`) |
 | Error taxonomy | `agent/error_classifier.py` (`FailoverReason` enum) |
 
@@ -175,8 +181,14 @@ trajectory-only and stripped before send.
   provider fallback; timeout → rebuild client; **context overflow → compress and
   retry**; image-too-large → shrink and retry; permanent auth → abort.
 - **Agent-level tools are intercepted *before* the registry** (`agent/agent_runtime_helpers.py`,
-  `AGENT_LEVEL_TOOLS`): `todo`, `session_search`, `memory`, `clarify`,
-  `read_terminal`, `delegate_task`. Everything else flows to `handle_function_call()`.
+  `AGENT_LEVEL_TOOLS`; execution in `agent/tool_executor.py`): `todo`,
+  `session_search`, `memory`, `clarify`, `read_terminal`, `delegate_task`, context-engine
+  tools, and memory-provider tools. Registry-dispatched tools still flow to
+  `handle_function_call()`.
+- **Turn finalization is a seam now** (`agent/turn_finalizer.py`): don't patch the loop
+  tail in `conversation_loop.py` for persistence, abnormal-exit explanations,
+  `transform_llm_output` / `post_llm_call` / `on_session_end` hooks, or background
+  memory/skill review; those belong in `finalize_turn()`.
 
 ### Cheat-sheet — to fix/optimize the loop, start in:
 
@@ -186,11 +198,14 @@ trajectory-only and stripped before send.
 | Budget exhausts too early/late | `agent/iteration_budget.py` + loop guard |
 | Interrupt / `/stop` ignored | interrupt check at top of loop; gateway `interrupt()` |
 | System prompt wrong / cache misses | `agent/system_prompt.py:113` (tier boundaries) |
-| Tool calls not executing | `_execute_tool_calls` (`run_agent.py:5157`) + dispatch |
+| Tool calls not executing | `_execute_tool_calls` (`run_agent.py:5157`) + `agent/tool_executor.py` dispatch |
+| Turn says it stopped / empty / partial | `agent/turn_finalizer.py` abnormal-exit explainer + result dict flags |
+| Tool result then token budget exhausted | `agent/conversation_loop.py` token-budget guard: if the transcript ends on `role=tool`, one API-call-time finalization pass strips tool schemas, attaches a no-tool final-answer directive to the last tool message, and terminates with a visible fallback if the model returns empty text or tries to call tools again. `agent/turn_finalizer.py` has the final belt-and-braces guard: if any abnormal path still reaches finalization with `last_msg_role=tool` and no `final_response`, it synthesizes and appends a real assistant reply before gateway normalization. Do **not** append a synthetic user turn; preserve role alternation and cached-prefix stability. Regression anchors: `tests/run_agent/test_run_agent.py::TestRunConversation::test_token_budget_after_tool_result_requests_no_tool_final_answer`, `test_token_budget_final_answer_refuses_new_tool_calls`, and `tests/run_agent/test_turn_completion_explainer.py::test_finalize_turn_pending_tool_token_budget_synthesizes_reply`. |
 | `memory`/`todo` not saved | `agent/agent_runtime_helpers.py` (agent-level interception) |
 | Streaming cuts off / hangs | `agent/chat_completion_helpers.py` (stale detectors) |
 | Reasoning content lost between turns | reasoning echo-back in the loop's message-prep step |
 | Misclassified provider error | `agent/error_classifier.py` (`FailoverReason`) |
+| Gateway says "Processing completed but no response was generated" | First check `gateway/run.py` `_run_agent()` empty-response early return and `_normalize_empty_agent_response()` before changing the agent loop; preserve `failed` / `partial` / `completed` / `error` evidence so the gateway can surface the real reason. |
 
 ---
 
@@ -230,12 +245,17 @@ trajectory-only and stripped before send.
   `get_tool_definitions()`, read by `execute_code` to know which tools the sandbox
   may call. `delegate_tool._run_single_child()` saves/restores it around subagents;
   it may be momentarily stale during a child run.
+- **Terminal background work is explicit-notify by design:** bounded long jobs should
+  set `background=true` + `notify_on_complete=true`; `watch_patterns` is only for rare
+  one-shot signals in long-lived processes and rate-limits itself before falling back to
+  completion notification. If terminal/process completion behavior looks wrong, inspect
+  `tools/terminal_tool.py` watcher setup and `tools/process_tool.py`, not the agent loop.
 
 ### Tool inventory (by category)
 
 | Category | Key file(s) | Tools |
 |---|---|---|
-| Terminal / process | `tools/terminal_tool.py` | `terminal`, `read_terminal` |
+| Terminal / process | `tools/terminal_tool.py`, `tools/process_tool.py` | `terminal`, `process`, `read_terminal` |
 | Files | `tools/file_tools.py` | `read_file`, `write_file`, `patch`, `search_files` |
 | Web / search | `tools/web_tools.py`, `x_search_tool.py` | `web_search`, `web_extract`, `x_search` |
 | Browser | `tools/browser_tool.py`, `browser_cdp_tool.py`, `browser_dialog_tool.py` | `browser_navigate`, `_snapshot`, `_click`, `_type`, … |
@@ -411,6 +431,24 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 | claude-code-acp spawns wrong CLI / streaming breaks | the 3 ACP guards (`agent_init.py` command-pop & Responses-upgrade, `conversation_loop.py` streaming) — must match the `create_openai_client` dispatch |
 | ACP per-call cold-start latency / warm pool | `agent/copilot_acp_client.py` `_AcpPool` / `_AcpConnection`; flag `route_decision.acp_persistent_process` |
 
+### Kanban review gate routing
+
+- **Decomposition route** (`hermes_cli/kanban_decompose.py`): after the auxiliary LLM
+  proposes a child graph, deterministic review-gate logic may append a final
+  `jarvisreview` child. The original implementation/research children keep their
+  assignees; the review child depends on graph leaves, so it runs after execution and
+  before the root/orchestrator wakes for final delivery.
+- **Triggers:** any high-risk/verification keyword in the root or child text (`deploy`,
+  `gateway`, `cron`, `permission`, `security`, `e2e`, `test`, `verify`, Chinese
+  equivalents, etc.) OR a cheap complexity score >= `kanban.review_gate.complexity_min`
+  (default `4`). Single-task decompositions route directly to `jarvisreview` when the
+  task itself is verification/review work.
+- **Config:** `kanban.review_gate.enabled` (default true),
+  `kanban.review_gate.assignee` (default `jarvisreview`), and
+  `kanban.review_gate.complexity_min` (default `4`). If the assignee profile is absent,
+  no review child is added. This is behavioral config, not a secret; keep it in
+  `config.yaml`, never `.env`.
+
 ---
 
 ## 7. State, Persistence & the `HERMES_HOME` Layout
@@ -567,12 +605,19 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 - Two frozen text stores — **`memories/MEMORY.md`** + **`USER.md`** — are injected as a
   **snapshot at session start** (volatile tier). The `memory` tool writes durably
   mid-session but **does not** mutate the cached prefix.
-- `MemoryProvider` ABC lifecycle: `initialize()`, `prefetch(query)` (background recall),
-  `sync_turn(turn_messages)` (after each turn, on a bg executor), `shutdown()`, optional
-  `post_setup()` / `on_session_switch()` / `on_pre_compress()` / `on_memory_write()`.
-  Orchestrated by `MemoryManager`. Built-in providers: honcho, mem0, supermemory,
-  byterover, hindsight, holographic, openviking, retaindb. **New providers ship as
-  standalone plugin repos** — the in-tree set is closed.
+- `MemoryProvider` ABC lifecycle: `initialize()`, `prefetch(query)` (current-turn recall),
+  `queue_prefetch(query)` (background recall), `sync_turn(turn_messages)` (after each
+  turn, on a bg executor), `shutdown()`, optional `post_setup()` /
+  `on_session_switch()` / `on_pre_compress()` / `on_memory_write()`. Orchestrated by
+  `MemoryManager`. Built-in providers: honcho, mem0, supermemory, byterover,
+  hindsight, holographic, openviking, retaindb. **New providers ship as standalone
+  plugin repos** — the in-tree set is closed.
+- **Honcho latency invariant:** `plugins/memory/honcho.HonchoMemoryProvider.prefetch()`
+  is on the pre-LLM critical path and must only consume already-cached base context /
+  dialectic results. It must not start or `join()` Honcho `peer.chat()` / dialectic
+  work. Agentic Dialectic synthesis runs only in session prewarm or `queue_prefetch()`
+  daemon threads, and a running dialectic surfaces on a later turn instead of delaying
+  the current response.
 
 ### C. Skills  (`tools/skills_tool.py`, `skills_hub.py`, `agent/skill_commands.py`, `tools/skill_usage.py`)
 
@@ -636,11 +681,35 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
     `route_decision.cron_model` (default `claude-sonnet-4-6`). Fail-silent — any
     error keeps the originally-resolved runtime (no regression). See the block right
     after `resolve_runtime_provider()` in `scheduler.py`.
-- **Kanban:** durable SQLite board (`kanban.db`) for multi-profile collaboration. A
-  dispatcher loop (default in-gateway) reclaims stale claims, promotes ready tasks,
-  atomically claims, and spawns assigned profiles. **Board** is the hard isolation
-  boundary (`HERMES_KANBAN_BOARD` pinned in worker env); after
-  `kanban.failure_limit` consecutive failures (default 2) a task auto-blocks.
+- **Kanban:** durable SQLite board (`hermes_cli/kanban_db.py`) for multi-profile,
+  multi-board collaboration. The default board remains `<root>/kanban.db` for
+  back-compat; additional boards live under `<root>/kanban/boards/<slug>/` with
+  isolated DB/workspaces/logs. Board resolution is explicit `--board` / function arg →
+  `HERMES_KANBAN_BOARD` → legacy `HERMES_KANBAN_DB` → `<root>/kanban/current` →
+  `default`. The dispatcher injects `HERMES_KANBAN_DB`,
+  `HERMES_KANBAN_WORKSPACES_ROOT`, and `HERMES_KANBAN_BOARD` into workers so worker
+  tools cannot accidentally see the wrong board.
+- **Kanban dispatcher hardening:** the dispatcher loop (default in-gateway) reclaims
+  stale claims, promotes ready tasks, atomically claims, and spawns assigned profiles.
+  SQLite WAL + `BEGIN IMMEDIATE` + CAS on `tasks.status`/`claim_lock` make claiming
+  per-board atomic. `last_heartbeat_at` detects wedged-but-still-alive workers;
+  host-local still-alive workers get a short reclaim deferral to avoid duplicate
+  spawns. Non-success outcomes now funnel through `_record_task_failure()` so
+  spawn-failed, crashed, and timed-out runs share `consecutive_failures`; per-task
+  `max_retries` overrides `kanban.failure_limit` / `DEFAULT_FAILURE_LIMIT`. Worker exit
+  code `75` (`KANBAN_RATE_LIMIT_EXIT_CODE`) is classified as `rate_limited`, requeued
+  without incrementing the failure counter.
+  Site-local watchdogs can live under `$HERMES_HOME/scripts/` rather than this repo:
+  e.g. `jarvis_kanban_completion_idle_retry.py` is a cron `no_agent` notifier/retry
+  script. For bad completion notification titles, inspect both `tasks.title/body` and
+  that script's `notification_title()` command-string summarizer before changing core
+  cron or gateway code.
+  The local Jarvis dashboard lives at `$HERMES_HOME/scripts/jarvis_kanban_dashboard.py`
+  (symlinked to `~/Jarvis/jarvis-ops/dashboards/`). For "no data" / date-filter bugs,
+  verify four layers before declaring success: `/healthz`, `/api/state`,
+  `/api/state?date=YYYY-MM-DD`, and a browser-visible page. Use
+  `/?date=YYYY-MM-DD&noevents=1` for automated page checks so the SSE `/events`
+  stream does not keep browser tools waiting forever; normal pages still use live SSE.
 
 ### Cheat-sheet
 
@@ -652,11 +721,129 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 | Curator archived something it shouldn't | `agent/curator.py` transitions + `is_agent_created`/pinned guards |
 | Subagent won't spawn / wrong toolset | `tools/delegate_tool.py` (`_build_child_agent`) |
 | Cron job missed / runs twice | `cron/scheduler.py` `tick()` + `cron/.tick.lock` |
-| Kanban task stuck / re-spawning | dispatcher loop + `failure_limit` auto-block |
+| Kanban task stuck / re-spawning | `hermes_cli/kanban_db.py` reclaim/heartbeat + `_record_task_failure()` + dispatcher `failure_limit`/`max_retries` |
+| Kanban worker rate-limited but task blocked | exit classifier around `KANBAN_RATE_LIMIT_EXIT_CODE` and `detect_crashed_workers._last_rate_limited` |
 
 ---
 
-## 10. Diagnostic Surfaces (run these before guessing)
+## 10. Incident Taxonomy & Self-Repair Strategy
+
+This section is grounded in cross-session evidence from `state.db` and prior incident
+write-ups, not a theoretical taxonomy. When searching history on 2026-06-24, the
+same families appeared across multiple sessions: `Processing stopped after using
+tools but produced no reply` (8 recent sessions), `Processing completed but no
+response was generated` (8), `provider timeout` (8), exhausted fallback chains (4),
+`stream_read_error` (3), `JSONDecodeError` (8), old custom-provider 429 daily-limit
+failures (7), HTTP 502 upstream failures (2), pending-tool turn endings (8), and
+`token_budget_exhausted` (8). Treat these as recurring classes until the monitoring
+history proves otherwise.
+
+### A. Tool-after-empty / abnormal turn endings
+
+- **Observed signatures:** gateway warnings like `Processing stopped after using tools
+  but produced no reply`, generic `Processing completed but no response was generated`,
+  logs with `last_msg_role=tool response_len=0`, `Turn ended with pending tool result`,
+  or `token_budget_exhausted:*` after tool execution.
+- **Primary repair path:** start in `agent/conversation_loop.py` for the token-budget
+  no-tool final-answer pass, then `agent/turn_finalizer.py` for belt-and-braces
+  synthetic assistant replies, then `gateway/run.py` `_run_agent()` and
+  `_normalize_empty_agent_response()` for user-visible normalization.
+- **Invariant:** never append a synthetic user message to escape the `tool` tail;
+  preserve role alternation and prompt-cache stability. If finalization needs a nudge,
+  make it API-call-scoped or append a real assistant fallback in finalization.
+- **Verification:** add/extend regression anchors under `tests/run_agent/` and
+  `tests/gateway/` that assert both the result dict evidence (`failed`, `partial`,
+  `completed`, `turn_exit_reason`, `last_msg_role`) and the exact gateway text.
+
+### B. Provider / transport instability
+
+- **Observed signatures:** `provider timeout`, `Fallback chain was exhausted or
+  unavailable`, old custom-provider `DAILY_LIMIT_EXCEEDED`, HTTP 502 upstream errors,
+  connection errors, and clusters tied to `sessions.billing_base_url`.
+- **Primary repair path:** inspect `agent/error_classifier.py`, provider adapters under
+  `agent/*_adapter.py`, `agent/credential_pool.py`, and fallback activation in
+  `agent/conversation_loop.py`. Use `sessions.billing_provider` and
+  `sessions.billing_base_url`, not current config alone, to attribute historical
+  incidents.
+- **Strategy:** distinguish three layers before changing code: provider returned an
+  error, provider returned no final assistant text, or Hermes normalized a valid final
+  text incorrectly. For custom OpenAI-compatible services, request service-side
+  request ids / stream close reason / upstream `finish_reason`; Hermes local logs are
+  API summaries, not raw HTTP-body proof.
+- **Verification:** reproduce against a temp `HERMES_HOME` or a controlled fake provider
+  that emits timeout, empty content, tool calls without final text, and retryable vs
+  permanent errors.
+
+### C. Cron and document-update failures
+
+- **Observed signatures:** cron sessions with `provider timeout`, fallback exhaustion,
+  `stream_read_error`, and Lark/doc CLI parse issues surfaced after the job had already
+  mutated or partially updated a document.
+- **Primary repair path:** start in `cron/scheduler.py` for runtime/fallback/interrupt
+  behavior and `cron/jobs.py` for persisted job state; for Lark/Feishu document jobs,
+  verify with `docs +fetch` after any `docs +update` / media insert before claiming the
+  cron succeeded.
+- **Strategy:** scheduled jobs need watchdog semantics: script/no-agent jobs should stay
+  silent on empty stdout, alert on non-zero exit, and include enough artifact paths for
+  triage. Never blindly re-run a document cron after an ambiguous failure; fetch the
+  target document, identify the exact missing/partial block, and repair only that block.
+- **Verification:** check `last_run_at`, `last_status`, newest `cron/output/<job_id>/`,
+  the cron session in `state.db`, and the target artifact/document itself.
+
+### D. Tool-output parsing and verification traps
+
+- **Observed signatures:** `JSONDecodeError` after commands whose stdout is progress
+  text rather than JSON, especially Lark media/document operations; retries can duplicate
+  side effects.
+- **Primary repair path:** inspect the tool or CLI contract first. Do not assume every
+  successful command emits JSON. For Lark CLI, `docs +media-insert` success evidence is
+  progress lines such as `Block created:` / `File uploaded:` plus fetch verification.
+- **Strategy:** parse only documented JSON outputs; otherwise capture stdout as text,
+  extract stable success markers, then verify via a readback command. If a pipe-to-Python
+  or parser fails, treat that as a verification-method failure until a safer fetch proves
+  the write failed.
+- **Verification:** read back the target section/count/marker and compare rendered Docx
+  semantics, not source Markdown or CLI `ok:true` alone.
+
+### E. State, path, and surface attribution errors
+
+- **Observed signatures:** old `~/.hermes` path assumptions after the migration to
+  `~/Jarvis/.hermes`, confusion between current config and historical session runtime,
+  Dashboard/API/UI layer mismatches, and user follow-ups like `？` after a turn ends
+  without delivery.
+- **Primary repair path:** use `get_hermes_home()` in code and `$HERMES_HOME` in scripts;
+  for historical evidence use `state.db` session metadata and message chronology; for
+  Dashboard or external surfaces verify layer-by-layer: config → API/data → rendered UI
+  → end-to-end user-visible behavior.
+- **Strategy:** when a task combines a business question and a Hermes repair, report the
+  two scopes separately: business artifact inspected, Hermes/Jarvis files changed, and
+  which repo was not modified. This prevents ambiguity like “why did you change Hermes
+  while analyzing a business project?”
+- **Verification:** every final report must name the verified layer and include real
+  command/test/fetch output. If the user had to send `？`, treat that as a delivery
+  incident and inspect whether the previous turn ended on a tool call, token budget,
+  provider timeout, or gateway normalization.
+
+### Incident response loop
+
+1. **Classify by evidence, not wording.** User-visible text is a symptom; collect
+   `state.db` session metadata/messages and `logs/agent.log` / `errors.log` first.
+2. **Bind to the actual runtime.** Use `sessions.model`, `billing_provider`,
+   `billing_base_url`, source (`feishu`, `cron`, etc.), and last message role.
+3. **Choose the owning layer.** Agent loop/finalizer, gateway normalization, provider
+   transport, cron scheduler, CLI/tool contract, or surface/UI delivery.
+4. **Repair the smallest durable seam.** Prefer finalizer/gateway/tool-contract fixes
+   and site-local watchdog scripts over widening core schema or mutating prompt context.
+5. **Add regression or watchdog coverage.** Unit tests for code seams; no-agent cron
+   watchdogs for production recurrence; incident exports under
+   `$HERMES_HOME/docs/incident-logs/` for evidence.
+6. **Update this map and skills.** If the fix changes where future agents should look,
+   update `SELF_ARCHITECTURE.md`; if it creates a reusable workflow, create or patch a
+   skill.
+
+---
+
+## 11. Diagnostic Surfaces (run these before guessing)
 
 | Need | Command / file |
 |---|---|
@@ -673,7 +860,7 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 
 ---
 
-## 11. Self-Maintenance Playbook (cross-cutting "I need to…")
+## 12. Self-Maintenance Playbook (cross-cutting "I need to…")
 
 | I need to… | Go to |
 |---|---|
@@ -694,7 +881,7 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 
 ---
 
-## 12. Hard Invariants & Gotchas (don't relearn these the hard way)
+## 13. Hard Invariants & Gotchas (don't relearn these the hard way)
 
 1. **Don't break prompt caching.** No mutating past context, swapping toolsets, or
    rebuilding the system prompt mid-conversation. Cache-aware slash commands default to
@@ -705,7 +892,9 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 3. **`config.yaml` for behavior, `.env` for secrets.** Reject any "set `HERMES_*` in
    your `.env`" for non-credentials.
 4. **Profile-safe paths only** — `get_hermes_home()` / `display_hermes_home()`, never
-   hardcoded `~/.hermes` (source of a 5-bug cluster).
+   hardcoded `~/.hermes` (source of a 5-bug cluster). This local install currently uses
+   `~/Jarvis/.hermes`; old `~/.hermes` references are stale unless explicitly talking
+   about default upstream docs.
 5. **Plugins must not modify core files** (`run_agent.py`, `cli.py`,
    `gateway/run.py`, `hermes_cli/main.py`). If a plugin needs more, widen the generic
    plugin surface.
@@ -721,10 +910,14 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
    disabled → hallucinated calls). Add cross-refs dynamically in
    `get_tool_definitions()`.
 10. **`delegate_task` is not durable** — interrupted parent cancels the child.
+11. **Don't debug abnormal turn endings in the wrong layer.** Empty/partial/stopped
+   user-visible output is usually `agent/turn_finalizer.py` + gateway normalization;
+   tool completion/notification issues are usually `agent/tool_executor.py` or
+   `tools/terminal_tool.py`/`tools/process_tool.py`, not the core API loop.
 
 ---
 
-## 13. Verifying a change
+## 14. Verifying a change
 
 ```bash
 # ALWAYS use the wrapper — it enforces CI-parity (hermetic env, UTC, unset keys,
@@ -741,7 +934,7 @@ resolution-chain/config/security/remote/IO changes, do **E2E validation against 
 
 ---
 
-## 14. Keeping this map honest
+## 15. Keeping this map honest
 
 - **Line numbers are a 2026-06-21 snapshot and will drift.** Navigate by the named
   symbols; re-grep when a pointer misses (`grep -n "def <name>\|class <name>"`).

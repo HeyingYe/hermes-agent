@@ -101,9 +101,19 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
-def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
+def _ollama_context_limit_error(
+    agent: Any,
+    request_tokens: int,
+    *,
+    tool_count: Optional[int] = None,
+) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
-    if not getattr(agent, "tools", None):
+    active_tool_count = (
+        len(getattr(agent, "tools", None) or [])
+        if tool_count is None
+        else tool_count
+    )
+    if active_tool_count <= 0:
         return None
 
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
@@ -115,7 +125,7 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     model = getattr(agent, "model", "") or "the selected model"
     base_url = getattr(agent, "base_url", "") or "unknown base URL"
     provider = getattr(agent, "provider", "") or "unknown"
-    tool_count = len(getattr(agent, "tools", None) or [])
+    tool_count = active_tool_count
 
     logger.warning(
         "Ollama runtime context too small for Hermes tool use: "
@@ -143,6 +153,21 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
         "model context). If you manage the model through an Ollama Modelfile, "
         "set `PARAMETER num_ctx 65536` there instead."
     )
+
+
+def _strip_tool_calling_from_final_answer_kwargs(api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove tool-calling controls for a token-budget final-answer pass."""
+    if not isinstance(api_kwargs, dict):
+        return api_kwargs
+    api_kwargs.pop("tools", None)
+    api_kwargs.pop("tool_choice", None)
+    api_kwargs.pop("parallel_tool_calls", None)
+    input_payload = api_kwargs.get("input")
+    if isinstance(input_payload, dict):
+        input_payload.pop("tools", None)
+        input_payload.pop("tool_choice", None)
+        input_payload.pop("parallel_tool_calls", None)
+    return api_kwargs
 
 
 def _ra():
@@ -583,6 +608,8 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _token_budget_final_answer = False
+    _token_budget_final_answer_attempted = False
 
     # P5.1: refresh the per-turn token budget. The per-session total persists
     # across turns (reset only in reset_session_state). This caps total context
@@ -625,14 +652,26 @@ def run_conversation(
         # P5.4: while on an expensive model (Opus), the tighter expensive caps apply.
         _tok_breach = _tb.breach(expensive=_tb.is_expensive(agent.model)) if _tb else None
         if _tok_breach:
-            _turn_exit_reason = f"token_budget_exhausted:{_tok_breach}"
-            if not agent.quiet_mode:
-                agent._safe_print(
-                    f"\n⚠️  Token budget exhausted ({_tok_breach}: turn="
-                    f"{agent.token_budget.turn_used:,} / session={agent.token_budget.session_used:,} "
-                    f"prompt-tokens) — stopping this turn to prevent runaway cost."
-                )
-            break
+            last_role = messages[-1].get("role") if messages else None
+            if last_role == "tool" and not _token_budget_final_answer_attempted:
+                _token_budget_final_answer = True
+                _token_budget_final_answer_attempted = True
+                _turn_exit_reason = f"token_budget_final_answer:{_tok_breach}"
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n⚠️  Token budget exhausted ({_tok_breach}: turn="
+                        f"{agent.token_budget.turn_used:,} / session={agent.token_budget.session_used:,} "
+                        "prompt-tokens) — requesting a final no-tool summary."
+                    )
+            else:
+                _turn_exit_reason = f"token_budget_exhausted:{_tok_breach}"
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n⚠️  Token budget exhausted ({_tok_breach}: turn="
+                        f"{agent.token_budget.turn_used:,} / session={agent.token_budget.session_used:,} "
+                        f"prompt-tokens) — stopping this turn to prevent runaway cost."
+                    )
+                break
 
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -816,6 +855,26 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # Token-budget finalization is API-call-time only: the durable
+        # transcript still ends with the real tool results. To preserve strict
+        # role alternation and prompt-cache stability, attach the one-shot
+        # final-answer directive to the last tool result instead of appending a
+        # synthetic user turn.
+        request_tools = None if _token_budget_final_answer else (agent.tools or None)
+        if _token_budget_final_answer:
+            finalizer_note = (
+                "\n\n[System: Token budget for this turn is exhausted. Do not "
+                "call any more tools. Produce the best concise final answer "
+                "using the tool results already visible in this conversation. "
+                "If work is incomplete, say exactly what was completed and "
+                "what remains.]"
+            )
+            for msg in reversed(api_messages):
+                if msg.get("role") == "tool":
+                    content = msg.get("content", "")
+                    msg["content"] = (content if isinstance(content, str) else str(content)) + finalizer_note
+                    break
+
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system
@@ -919,11 +978,13 @@ def run_conversation(
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         approx_request_tokens = estimate_request_tokens_rough(
-            api_messages, tools=agent.tools or None
+            api_messages, tools=request_tools
         )
 
         _runtime_context_error = _ollama_context_limit_error(
-            agent, approx_request_tokens
+            agent,
+            approx_request_tokens,
+            tool_count=len(request_tools or []),
         )
         if _runtime_context_error:
             final_response = _runtime_context_error
@@ -1039,6 +1100,8 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if _token_budget_final_answer:
+                    _strip_tool_calling_from_final_answer_kwargs(api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1112,7 +1175,7 @@ def run_conversation(
                             if isinstance(request_messages, list)
                             else [],
                             message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
+                            tool_count=len(request_tools or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
@@ -3995,6 +4058,23 @@ def run_conversation(
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 
+                # If the model ignores the no-tool finalization directive and
+                # returns tool calls anyway, do not execute them. Executing more
+                # tools here recreates the exact exhausted-budget loop this pass
+                # is meant to terminate. Surface an explicit partial completion
+                # so the gateway/user gets a reply instead of a stuck warning.
+                if _token_budget_final_answer:
+                    _turn_exit_reason = "token_budget_final_answer_tool_refusal"
+                    final_response = (
+                        "⚠️ Token budget was exhausted after the last tool results. "
+                        "The model tried to call more tools during the required final-answer pass, "
+                        "so I stopped instead of continuing the loop. Please send `continue` or "
+                        "start a fresh session if you want me to keep working."
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._emit_status("⚠️ Stopped extra tool calls during token-budget finalization")
+                    break
+
                 # If this turn has both content AND tool_calls, capture the content
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
@@ -4141,7 +4221,7 @@ def run_conversation(
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages, tools=request_tools
                     )
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
@@ -4225,6 +4305,18 @@ def run_conversation(
                         agent._response_was_previewed = True
                         break
 
+                    if _token_budget_final_answer:
+                        _turn_exit_reason = "token_budget_final_answer_empty"
+                        final_response = (
+                            "⚠️ Token budget was exhausted after the last tool results, "
+                            "and the model returned no final text during the no-tool final-answer pass. "
+                            "I stopped instead of spending more tokens in the loop. Please send `continue` "
+                            "or start a fresh session if you want me to keep working."
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
+                        agent._emit_status("⚠️ Token-budget final-answer pass returned empty")
+                        break
+
                     # ── Post-tool-call empty response nudge ───────────
                     # The model returned empty after executing tool calls.
                     # This covers two cases:
@@ -4281,13 +4373,45 @@ def run_conversation(
                         _nudge_msg["content"] = "(empty)"
                         _nudge_msg["_empty_recovery_synthetic"] = True
                         messages.append(_nudge_msg)
-                        messages.append({
-                            "role": "user",
-                            "content": (
+                        # If the last tool result was BLANK (e.g. a `claude -p`
+                        # that exited with no output), the generic "process the
+                        # results above" nudge is non-actionable — there is
+                        # nothing to process, so the model just re-drifts empty.
+                        # Give a directive nudge instead so it retries/inspects
+                        # or summarizes what it accomplished.
+                        _blank_tool_note = None
+                        for _m in reversed(messages):
+                            if isinstance(_m, dict) and _m.get("role") == "tool":
+                                try:
+                                    _tr = json.loads(_m.get("content") or "{}")
+                                except Exception:
+                                    _tr = {}
+                                if isinstance(_tr, dict) and not str(_tr.get("output") or "").strip():
+                                    _code = _tr.get("exit_code")
+                                    _mean = _tr.get("exit_code_meaning")
+                                    _blank_tool_note = (
+                                        "The last command/tool returned no output"
+                                        + (f" (exit code {_code})" if _code is not None else "")
+                                        + (f": {_mean}" if _mean else "")
+                                        + "."
+                                    )
+                                break
+                        if _blank_tool_note:
+                            _nudge_user_text = (
+                                f"{_blank_tool_note} Decide whether to retry it, "
+                                "inspect the result (e.g. run git diff/status in "
+                                "the workspace), or summarize what you "
+                                "accomplished. Do not reply with an empty message."
+                            )
+                        else:
+                            _nudge_user_text = (
                                 "You just executed tool calls but returned an "
                                 "empty response. Please process the tool "
                                 "results above and continue with the task."
-                            ),
+                            )
+                        messages.append({
+                            "role": "user",
+                            "content": _nudge_user_text,
                             "_empty_recovery_synthetic": True,
                         })
                         continue

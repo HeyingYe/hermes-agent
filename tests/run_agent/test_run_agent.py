@@ -3456,6 +3456,82 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_token_budget_after_tool_result_requests_no_tool_final_answer(self, agent):
+        self._setup_agent(agent)
+        from agent.token_budget import TokenBudget
+
+        agent.token_budget = TokenBudget(per_turn_limit=10, per_session_limit=0)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 11, "completion_tokens": 1, "total_tokens": 12},
+        )
+        resp2 = _mock_response(
+            content="I found enough to answer from the tool result.",
+            finish_reason="stop",
+            usage={"prompt_tokens": 8, "completion_tokens": 8, "total_tokens": 16},
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "I found enough to answer from the tool result."
+        assert result["api_calls"] == 2
+        second_request = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert "tools" not in second_request
+        assert "tool_choice" not in second_request
+        assert second_request["messages"][-1]["role"] == "tool"
+        assert "Do not call any more tools" in second_request["messages"][-1]["content"]
+
+    def test_token_budget_final_answer_refuses_new_tool_calls(self, agent):
+        self._setup_agent(agent)
+        from agent.token_budget import TokenBudget
+
+        agent.token_budget = TokenBudget(per_turn_limit=10, per_session_limit=0)
+        first_tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        second_tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[first_tc],
+            usage={"prompt_tokens": 11, "completion_tokens": 1, "total_tokens": 12},
+        )
+        resp2 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[second_tc],
+            usage={"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["turn_exit_reason"] == "token_budget_final_answer_tool_refusal"
+        assert "tried to call more tools" in result["final_response"]
+        assert result["api_calls"] == 2
+        mock_handle_function_call.assert_called_once()
+        assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
+
+        second_request = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert "tools" not in second_request
+        assert "tool_choice" not in second_request
+        assert second_request["messages"][-1]["role"] == "tool"
+        assert "Do not call any more tools" in second_request["messages"][-1]["content"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

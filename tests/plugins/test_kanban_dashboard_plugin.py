@@ -247,6 +247,23 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert 'readSelectedBoard() || "default"' not in js
 
 
+def test_dashboard_task_card_renders_relationship_previews():
+    """Cards should name their parent/child tasks, not just show link counts."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert '"blocked-by-deps", "scheduled", "ready", "running", "blocked", "review"' in js
+    assert '"blocked-by-deps": "Blocked by Deps"' in js
+    assert '"blocked-by-deps": "hermes-kanban-dot-blocked-by-deps"' in js
+    assert "const relationships = t.relationships || { parents: [], children: [] };" in js
+    assert 'tx(i18n, "parentTask", "Parent")' in js
+    assert 'tx(i18n, "childTasks", "Children")' in js
+    assert "hermes-kanban-card-relation--parent" in js
+    assert "hermes-kanban-card-relation--children" in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
@@ -260,7 +277,7 @@ def test_task_detail_includes_links_and_events(client):
         "/api/plugins/kanban/tasks",
         json={"title": "child", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"  # parent not done yet
+    assert child["status"] == "blocked-by-deps"  # parent not done yet
 
     # Detail for the child shows the parent link.
     r = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
@@ -272,6 +289,28 @@ def test_task_detail_includes_links_and_events(client):
     # Detail for the parent shows the child.
     r = client.get(f"/api/plugins/kanban/tasks/{parent['id']}")
     assert child["id"] in r.json()["links"]["children"]
+
+    # Board cards include compact relationship previews so subtasks remain
+    # visually attached to the originating user request without opening drawers.
+    board = client.get("/api/plugins/kanban/board").json()
+    by_id = {
+        task["id"]: task
+        for column in board["columns"]
+        for task in column["tasks"]
+    }
+    child_card = by_id[child["id"]]
+    parent_card = by_id[parent["id"]]
+    assert child_card["link_counts"] == {"parents": 1, "children": 0}
+    assert child_card["relationships"]["parents"] == [
+        {
+            "id": parent["id"],
+            "title": "parent",
+            "status": parent["status"],
+            "assignee": parent["assignee"],
+        }
+    ]
+    assert parent_card["link_counts"] == {"parents": 0, "children": 1}
+    assert parent_card["relationships"]["children"][0]["id"] == child["id"]
 
     # Events exist from creation.
     assert len(data["events"]) >= 1
@@ -343,9 +382,8 @@ def test_patch_schedule_then_unblock(client):
     assert r.json()["task"]["status"] == "ready"
 
 
-def test_patch_drag_drop_move_todo_to_ready(client):
-    """Direct status write: the drag-drop path for statuses without a
-    dedicated verb (e.g. manually promoting todo -> ready).
+def test_patch_drag_drop_move_blocked_by_deps_to_ready(client):
+    """Direct status write: the drag-drop path for dependency-blocked tasks.
 
     Promoting a child whose parent is not done is rejected (409).
     Promoting a child whose parent IS done is accepted (200)."""
@@ -354,7 +392,7 @@ def test_patch_drag_drop_move_todo_to_ready(client):
         "/api/plugins/kanban/tasks",
         json={"title": "c", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"
+    assert child["status"] == "blocked-by-deps"
 
     # Rejected: parent not done yet.
     r = client.patch(
@@ -399,7 +437,7 @@ def test_reopening_parent_demotes_ready_child(client):
         "/api/plugins/kanban/tasks",
         json={"title": "c", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"
+    assert child["status"] == "blocked-by-deps"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
@@ -421,7 +459,7 @@ def test_reopening_parent_demotes_ready_child(client):
     child_after_reopen = client.get(
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
-    assert child_after_reopen["status"] == "todo"
+    assert child_after_reopen["status"] == "blocked-by-deps"
 
 
 def test_patch_reassign(client):

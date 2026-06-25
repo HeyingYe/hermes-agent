@@ -57,14 +57,14 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         c0 = kb.get_task(conn, child_ids[0])
         c1 = kb.get_task(conn, child_ids[1])
 
-    # Root flipped to todo with orchestrator assignee, gated by children.
-    assert root.status == "todo"
+    # Root moved to blocked-by-deps with orchestrator assignee, gated by children.
+    assert root.status == "blocked-by-deps"
     assert root.assignee == "orchestrator"
     # First child has no internal parents → ready on recompute_ready.
     assert c0.status == "ready"
     assert c0.assignee == "researcher"
-    # Second child has parents=[0] → stays in todo until c0 completes.
-    assert c1.status == "todo"
+    # Second child has parents=[0] → stays in blocked-by-deps until c0 completes.
+    assert c1.status == "blocked-by-deps"
     assert c1.assignee == "engineer"
 
 

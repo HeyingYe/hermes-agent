@@ -325,12 +325,12 @@ def _(home, kb):
         b = kb.create_task(conn, title="B", assignee="w", parents=[root])
         leaf = kb.create_task(conn, title="leaf", assignee="w", parents=[a, b])
 
-        # A done but B not → leaf stays todo
+        # A done but B not → leaf stays blocked-by-deps
         kb.claim_task(conn, a)
         kb.complete_task(conn, a, result="a done")
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, leaf).status == "todo", (
-            f"leaf should still be todo with B unfinished, got "
+        assert kb.get_task(conn, leaf).status == "blocked-by-deps", (
+            f"leaf should still be blocked-by-deps with B unfinished, got "
             f"{kb.get_task(conn, leaf).status}"
         )
         # Both done → leaf promotes
@@ -393,8 +393,8 @@ def _(home, kb):
             kb.claim_task(conn, p)
             kb.complete_task(conn, p)
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, child).status == "todo", (
-            "child should still be todo with 1/500 parents incomplete"
+        assert kb.get_task(conn, child).status == "blocked-by-deps", (
+            "child should still be blocked-by-deps with 1/500 parents incomplete"
         )
         # Finish the last one
         kb.claim_task(conn, parents[-1])
@@ -953,12 +953,12 @@ def _(home, kb):
 
         # Child with just one parent, cycle it through each state
         for parent, expected in [
-            (p_ready, "todo"),     # parent not done → child stays todo
-            (p_running, "todo"),
-            (p_blocked, "todo"),
-            (p_triage, "todo"),
-            (p_archived, "todo"),  # archived != done!
-            (p_done, "ready"),     # only done parent unblocks child
+            (p_ready, "blocked-by-deps"),     # parent not done → child waits on deps
+            (p_running, "blocked-by-deps"),
+            (p_blocked, "blocked-by-deps"),
+            (p_triage, "blocked-by-deps"),
+            (p_archived, "ready"),  # archived counts as satisfied → child promotes
+            (p_done, "ready"),     # done/archived parent unblocks child
         ]:
             child = kb.create_task(
                 conn, title=f"child-of-{parent}", assignee="w", parents=[parent],

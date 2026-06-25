@@ -49,6 +49,51 @@ from hermes_cli import profiles as profiles_mod
 logger = logging.getLogger(__name__)
 
 
+_REVIEW_ASSIGNEE = "jarvisreview"
+_REVIEW_TRIGGER_KEYWORDS = (
+    "approval",
+    "approve",
+    "auth",
+    "credential",
+    "cron",
+    "dashboard",
+    "delete",
+    "deploy",
+    "diff",
+    "e2e",
+    "external",
+    "gateway",
+    "launchagent",
+    "merge",
+    "permission",
+    "production",
+    "publish",
+    "push",
+    "release",
+    "review",
+    "security",
+    "share",
+    "test",
+    "verify",
+    "webhook",
+    "验收",
+    "复核",
+    "验证",
+    "测试",
+    "权限",
+    "安全",
+    "外发",
+    "发布",
+    "删除",
+    "部署",
+    "上线",
+    "网关",
+    "自动化",
+    "看板",
+    "仪表盘",
+)
+
+
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
 A user dropped a rough idea into the Triage column. Your job is to break it
@@ -268,6 +313,98 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _review_gate_config(cfg: dict) -> dict:
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    gate = kanban_cfg.get("review_gate", {})
+    if not isinstance(gate, dict):
+        gate = {}
+    return gate
+
+
+def _review_gate_enabled(cfg: dict) -> bool:
+    return bool(_review_gate_config(cfg).get("enabled", True))
+
+
+def _review_complexity_min(cfg: dict) -> int:
+    raw = _review_gate_config(cfg).get("complexity_min", 4)
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _review_assignee(cfg: dict, valid_names: set[str]) -> Optional[str]:
+    gate = _review_gate_config(cfg)
+    name = str(gate.get("assignee") or _REVIEW_ASSIGNEE).strip()
+    if name in valid_names:
+        return name
+    return None
+
+
+def _task_text_for_review(title: str, body: str, children: list[dict] | None = None) -> str:
+    parts = [title or "", body or ""]
+    for child in children or []:
+        parts.append(str(child.get("title") or ""))
+        parts.append(str(child.get("body") or ""))
+        parts.append(str(child.get("assignee") or ""))
+    return "\n".join(parts).lower()
+
+
+def _review_complexity_score(title: str, body: str, children: list[dict] | None = None) -> int:
+    text = _task_text_for_review(title, body, children)
+    score = 1
+    if len(text) > 600:
+        score += 1
+    if len(text) > 1800:
+        score += 1
+    if children and len(children) >= 3:
+        score += 1
+    if any(token in text for token in ("risk", "security", "权限", "安全", "生产", "production")):
+        score += 1
+    return max(1, min(5, score))
+
+
+def _needs_review_gate(cfg: dict, title: str, body: str, children: list[dict] | None = None) -> bool:
+    if not _review_gate_enabled(cfg):
+        return False
+    text = _task_text_for_review(title, body, children)
+    if any(keyword in text for keyword in _REVIEW_TRIGGER_KEYWORDS):
+        return True
+    return _review_complexity_score(title, body, children) >= _review_complexity_min(cfg)
+
+
+def _append_review_gate_if_needed(
+    cfg: dict,
+    *,
+    root_title: str,
+    root_body: str,
+    children: list[dict],
+    valid_names: set[str],
+) -> None:
+    reviewer = _review_assignee(cfg, valid_names)
+    if not reviewer or not _needs_review_gate(cfg, root_title, root_body, children):
+        return
+    if any(child.get("assignee") == reviewer for child in children):
+        return
+    leaf_indices = set(range(len(children)))
+    for idx, child in enumerate(children):
+        for parent_idx in child.get("parents") or []:
+            if isinstance(parent_idx, int) and 0 <= parent_idx < len(children):
+                leaf_indices.discard(parent_idx)
+    parents = sorted(leaf_indices) or list(range(len(children)))
+    children.append({
+        "title": "Independently verify acceptance",
+        "body": (
+            "Review the completed child tasks before final acceptance. "
+            "Validate claimed outputs, test/evidence quality, diffs or config changes, "
+            "and any safety/permission boundary. Return an acceptance note with "
+            "accepted/rejected status, evidence checked, and residual risks."
+        ),
+        "assignee": reviewer,
+        "parents": parents,
+    })
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -361,11 +498,19 @@ def decompose_task(
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
         assignee_val = None
         if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
-                default_assignee=default_assignee,
-                valid_names=valid_names,
-            )
+            reviewer = _review_assignee(cfg, valid_names)
+            if reviewer and _needs_review_gate(
+                cfg,
+                title_val or task.title or "",
+                body_val or task.body or "",
+            ):
+                assignee_val = reviewer
+            else:
+                assignee_val = _normalize_assignee_choice(
+                    parsed.get("assignee"),
+                    default_assignee=default_assignee,
+                    valid_names=valid_names,
+                )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -437,6 +582,14 @@ def decompose_task(
             "assignee": chosen,
             "parents": clean_parents,
         })
+
+    _append_review_gate_if_needed(
+        cfg,
+        root_title=task.title or "",
+        root_body=task.body or "",
+        children=children,
+        valid_names=valid_names,
+    )
 
     try:
         with kb.connect_closing() as conn:

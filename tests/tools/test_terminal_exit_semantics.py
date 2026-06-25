@@ -147,6 +147,48 @@ class TestInterpretExitCode:
     def test_empty_command(self):
         assert _interpret_exit_code("", 1) is None
 
+    # ---- claude -p (headless coding tool) ----
+
+    def test_claude_timeout_124_has_note(self):
+        result = _interpret_exit_code("claude -p 'do the task' --add-dir /tmp", 124)
+        assert result is not None
+        assert "claude -p timed out" in result.lower() or "timed out" in result.lower()
+
+    def test_claude_exit_zero_returns_none(self):
+        # rc0 is never an error note from _interpret_exit_code (the empty-output
+        # annotation for claude is handled in terminal_tool, not here).
+        assert _interpret_exit_code("claude -p 'x'", 0) is None
+
+
+class TestBaseCommandName:
+    """_base_command_name mirrors _interpret_exit_code's extraction so the
+    empty-output annotation can scope to `claude`."""
+
+    def test_simple(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("claude -p 'x' --add-dir /tmp") == "claude"
+
+    def test_full_path(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("/usr/local/bin/claude -p 'x'") == "claude"
+
+    def test_env_prefix(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("HOME=/Users/x JARVIS_CLAUDE_CONTEXT=1 claude -p 'x'") == "claude"
+
+    def test_pipeline_last_segment(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("cat prompt.txt | claude -p") == "claude"
+
+    def test_chained_last_segment(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("cd /repo && claude -p 'x'") == "claude"
+
+    def test_non_claude(self):
+        from tools.terminal_tool import _base_command_name
+        assert _base_command_name("true") == "true"
+        assert _base_command_name("") == ""
+
     def test_only_env_vars(self):
         """Command with only env var assignments, no actual command."""
         assert _interpret_exit_code("FOO=bar", 1) is None

@@ -33,8 +33,8 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         assert root.assignee == "orchestrator"
         assert [task.status for task in workers] == ["ready", "ready"]
         assert [task.assignee for task in workers] == ["researcher-a", "researcher-b"]
-        assert verifier.status == "todo"
-        assert synthesizer.status == "todo"
+        assert verifier.status == "blocked-by-deps"
+        assert synthesizer.status == "blocked-by-deps"
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
         assert all(created.root_id in (task.body or "") for task in workers)
@@ -97,13 +97,13 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             metadata={"confidence": 0.8},
         )
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, created.verifier_id).status == "todo"
-        assert kb.get_task(conn, created.synthesizer_id).status == "todo"
+        assert kb.get_task(conn, created.verifier_id).status == "blocked-by-deps"
+        assert kb.get_task(conn, created.synthesizer_id).status == "blocked-by-deps"
 
         kb.complete_task(conn, created.worker_ids[1], summary="B done")
         kb.recompute_ready(conn)
         assert kb.get_task(conn, created.verifier_id).status == "ready"
-        assert kb.get_task(conn, created.synthesizer_id).status == "todo"
+        assert kb.get_task(conn, created.synthesizer_id).status == "blocked-by-deps"
 
         kb.complete_task(
             conn,

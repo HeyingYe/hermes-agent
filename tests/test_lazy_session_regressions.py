@@ -14,6 +14,53 @@ import types
 from unittest.mock import MagicMock, patch
 
 
+# ===========================================================================
+# Token-budget final-answer helpers
+# ===========================================================================
+
+class TestTokenBudgetFinalAnswerHelpers:
+    def test_final_answer_kwargs_strip_all_tool_controls(self):
+        from agent.conversation_loop import _strip_tool_calling_from_final_answer_kwargs
+
+        payload = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "terminal"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "input": {
+                "messages": [],
+                "tools": [{"name": "terminal"}],
+                "tool_choice": "required",
+                "parallel_tool_calls": True,
+            },
+        }
+
+        result = _strip_tool_calling_from_final_answer_kwargs(payload)
+
+        assert result is payload
+        assert "tools" not in result
+        assert "tool_choice" not in result
+        assert "parallel_tool_calls" not in result
+        assert "tools" not in result["input"]
+        assert "tool_choice" not in result["input"]
+        assert "parallel_tool_calls" not in result["input"]
+
+    def test_ollama_small_context_check_uses_request_tool_count(self):
+        from agent.conversation_loop import _ollama_context_limit_error
+
+        agent = types.SimpleNamespace(
+            tools=[{"name": "terminal"}],
+            _ollama_num_ctx=4096,
+            model="qwen",
+            base_url="http://localhost:11434/v1",
+            provider="ollama",
+            session_id="s1",
+        )
+
+        assert _ollama_context_limit_error(agent, 80_000, tool_count=0) is None
+        assert _ollama_context_limit_error(agent, 80_000, tool_count=1)
+
+
 
 # ===========================================================================
 # Helpers
@@ -414,6 +461,174 @@ class TestGatewaySurfacesNullResponse:
         )
 
         assert result == "Hello!"
+
+    def test_completed_false_no_error_surfaces_actionable_diagnostic(self):
+        """Empty turn that used tools but did not complete (no error/partial)
+        gets an actionable diagnostic, NOT the generic transient message."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 7,
+            "partial": False,
+            "interrupted": False,
+            "failed": False,
+            "completed": False,
+        }
+
+        response = agent_result.get("final_response") or ""
+        result = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert result != ""
+        assert "no response was generated" not in result
+        assert "/reset" in result
+
+    def test_nonfailed_error_is_surfaced(self):
+        """An ``error`` that survived without the ``failed`` flag (e.g. a
+        truncation/rollback path) is surfaced instead of the generic message."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 4,
+            "partial": False,
+            "interrupted": False,
+            "failed": False,
+            "completed": False,
+            "error": "Response truncated due to output length limit",
+        }
+
+        response = agent_result.get("final_response") or ""
+        result = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert "truncated due to output length limit" in result
+        assert "no response was generated" not in result
+
+    def test_clean_empty_completion_keeps_transient_message(self):
+        """A turn that finished cleanly (completed truthy / no evidence) but
+        emitted no text keeps the honest transient-retry fallback."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 1,
+            "partial": False,
+            "interrupted": False,
+            "failed": False,
+            "completed": True,
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "", history_len=5,
+        )
+
+        assert "no response was generated" in result
+
+    def test_partial_with_none_error_does_not_say_none(self):
+        """partial=True with error=None must not render the literal 'None'."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 2,
+            "partial": True,
+            "error": None,
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "", history_len=5,
+        )
+
+        assert "None" not in result
+        assert "processing incomplete" in result
+
+    def test_codex_completed_true_empty_after_tools_is_surfaced(self):
+        """Recurrence path: the codex app-server runtime reports
+        ``completed=True`` with no ``interrupted``/``turn_exit_reason`` keys
+        even when gpt-5.5 stopped after a tool batch with no final reply
+        (null-output drift). The transcript ends on a tool result, so this is
+        a stopped-mid-work turn — it must NOT degrade to the generic transient
+        message."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 1,
+            "partial": False,
+            "failed": False,
+            "completed": True,  # codex sets this even on empty final_text
+            "messages": [
+                {"role": "user", "content": "do the thing"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "c1", "function": {"name": "bash"}}],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "", history_len=5,
+        )
+
+        assert "no response was generated" not in result
+        assert "stopped after using tools" in result
+        assert "/reset" in result
+
+    def test_abnormal_turn_exit_reason_is_surfaced(self):
+        """A turn that exited for a non-clean reason (e.g. budget/token
+        exhaustion) but still reports ``completed=True`` with an empty reply
+        must surface the stopped-mid-work diagnostic, not the generic
+        transient message."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 4,
+            "partial": False,
+            "failed": False,
+            "interrupted": False,
+            "completed": True,
+            "turn_exit_reason": "token_budget_exhausted:turn",
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "", history_len=5,
+        )
+
+        assert "no response was generated" not in result
+        assert "stopped after using tools" in result
+
+    def test_clean_text_response_exit_keeps_transient_message(self):
+        """A turn that exited via a clean ``text_response`` finish but emitted
+        no visible text keeps the honest transient-retry fallback — the empty
+        reply here is a genuine empty completion, not a mid-work stop."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 1,
+            "partial": False,
+            "failed": False,
+            "interrupted": False,
+            "completed": True,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": ""},
+            ],
+        }
+
+        result = _normalize_empty_agent_response(
+            agent_result, "", history_len=5,
+        )
+
+        assert "no response was generated" in result
 
 
 # ===========================================================================

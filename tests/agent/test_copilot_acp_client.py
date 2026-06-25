@@ -207,3 +207,156 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+# ── Empty-response receiving-layer recovery ────────────────────────────
+# Regression for the "Processing completed but no response was generated"
+# empty-response bug on the Claude Code / ACP path: a turn that did work via
+# the engine's own tools (or was permission-declined, or stopped abnormally)
+# but streamed no agent_message_chunk text used to return "" — a silent empty
+# that burned the loop's empty-retry budget and surfaced the bland gateway
+# warning, hiding that real work happened.
+
+from agent.copilot_acp_client import _synthesize_empty_turn_note
+
+
+class _StdinlessProc:
+    """session/update is handled before the stdin guard, so no stdin needed."""
+
+    stdin = None
+
+
+def _update_msg(kind, *, text=None, content=None, title=None):
+    update = {"sessionUpdate": kind}
+    if content is not None:
+        update["content"] = content
+    elif text is not None:
+        update["content"] = {"type": "text", "text": text}
+    if title is not None:
+        update["title"] = title
+    return {"jsonrpc": "2.0", "method": "session/update", "params": {"update": update}}
+
+
+def _acp_client(tmp_path):
+    return CopilotACPClient(acp_cwd=str(tmp_path))
+
+
+def test_handle_message_captures_list_shaped_content(tmp_path):
+    client = _acp_client(tmp_path)
+    text_parts: list = []
+    client._handle_server_message(
+        _update_msg(
+            "agent_message_chunk",
+            content=[{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}],
+        ),
+        process=_StdinlessProc(),
+        cwd=str(tmp_path),
+        text_parts=text_parts,
+        reasoning_parts=[],
+        meta={},
+    )
+    assert "".join(text_parts) == "hello world"
+
+
+def test_handle_message_records_tool_activity(tmp_path):
+    client = _acp_client(tmp_path)
+    meta: dict = {}
+    client._handle_server_message(
+        _update_msg("tool_call", title="Edit"),
+        process=_StdinlessProc(),
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+        meta=meta,
+    )
+    assert meta.get("saw_tool_activity") is True
+    assert "Edit" in meta.get("tools", [])
+
+
+def test_handle_message_records_permission_cancel(tmp_path):
+    client = _acp_client(tmp_path)
+    meta: dict = {}
+    process = _FakeProcess()  # real StringIO stdin (permission path writes a reply)
+    msg = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "session/request_permission",
+        "params": {"toolCall": {"kind": "execute", "title": "Bash"}},
+    }
+    client._handle_server_message(
+        msg,
+        process=process,
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+        meta=meta,
+    )
+    assert meta.get("permission_cancelled") is True
+    assert "Bash" in meta.get("blocked_tools", [])
+    # Still declines on the wire (no security regression).
+    reply = json.loads(process.stdin.getvalue().strip())
+    assert reply["result"]["outcome"]["outcome"] == "cancelled"
+
+
+def test_synthesize_note_for_tool_activity():
+    note = _synthesize_empty_turn_note(
+        "end_turn", {"saw_tool_activity": True, "tools": ["Edit", "Bash"]}, ""
+    )
+    assert note and "tool" in note.lower()
+
+
+def test_synthesize_note_for_permission_cancel():
+    note = _synthesize_empty_turn_note(
+        "end_turn", {"permission_cancelled": True, "blocked_tools": ["Bash"]}, ""
+    )
+    assert note and "permission" in note.lower()
+
+
+def test_synthesize_note_for_abnormal_stop_reason():
+    assert "max_tokens" in _synthesize_empty_turn_note("max_tokens", {}, "")
+
+
+def test_synthesize_note_empty_for_clean_empty():
+    # No positive evidence of work: keep the transient-empty retry path intact.
+    assert _synthesize_empty_turn_note("end_turn", {}, "") == ""
+    assert _synthesize_empty_turn_note(None, {}, "") == ""
+
+
+def test_send_prompt_synthesizes_note_on_tool_only_turn(tmp_path, monkeypatch):
+    client = _acp_client(tmp_path)
+
+    def fake_acp_request(conn, method, params, *, timeout_seconds, text_parts=None, reasoning_parts=None, meta=None):
+        if meta is not None:
+            meta["saw_tool_activity"] = True
+            meta.setdefault("tools", []).append("Edit")
+        return {"stopReason": "end_turn"}
+
+    monkeypatch.setattr(client, "_acp_request", fake_acp_request)
+    text, reasoning, usage = client._send_prompt(None, "sess", "do the edit", 1.0)
+    assert text and "tool" in text.lower()
+
+
+def test_send_prompt_returns_text_on_normal_turn(tmp_path, monkeypatch):
+    client = _acp_client(tmp_path)
+
+    def fake_acp_request(conn, method, params, *, timeout_seconds, text_parts=None, reasoning_parts=None, meta=None):
+        if text_parts is not None:
+            text_parts.append("the answer")
+        return {"stopReason": "end_turn", "usage": {"input_tokens": 1}}
+
+    monkeypatch.setattr(client, "_acp_request", fake_acp_request)
+    text, reasoning, usage = client._send_prompt(None, "sess", "q", 1.0)
+    assert text == "the answer"
+
+
+def test_send_prompt_clean_empty_stays_empty(tmp_path, monkeypatch):
+    client = _acp_client(tmp_path)
+
+    def fake_acp_request(conn, method, params, *, timeout_seconds, text_parts=None, reasoning_parts=None, meta=None):
+        return {"stopReason": "end_turn"}
+
+    monkeypatch.setattr(client, "_acp_request", fake_acp_request)
+    text, reasoning, usage = client._send_prompt(None, "sess", "q", 1.0)
+    # Preserved as empty so the conversation loop's transient-empty
+    # retry/fallback ladder runs unchanged.
+    assert text == ""

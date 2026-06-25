@@ -142,7 +142,43 @@ def finalize_turn(
     agent._drop_trailing_empty_response_scaffolding(messages)
     agent._persist_session(messages, conversation_history)
 
-    # ── Turn-exit diagnostic log ─────────────────────────────────────
+    # If the loop still exits while the durable transcript ends on a tool
+    # result and no final response was produced, synthesize an actionable
+    # response here. This is a belt-and-braces guard for the exact gateway
+    # failure where users otherwise see only "Processing stopped after using
+    # tools but produced no reply". The loop should normally trigger a
+    # token-budget final-answer pass before reaching this point, but runtime
+    # drift, older in-memory gateway code, or a newly added abnormal exit path
+    # must not leave messaging users with a blank turn.
+    if not interrupted:
+        _last_for_pending = messages[-1] if messages else None
+        if (
+            isinstance(_last_for_pending, dict)
+            and _last_for_pending.get("role") == "tool"
+            and not (final_response or "").strip()
+        ):
+            reason = str(_turn_exit_reason or "pending_tool_result")
+            if reason == "unknown":
+                reason = "pending_tool_result"
+            _turn_exit_reason = reason
+            if reason.startswith("token_budget_exhausted"):
+                final_response = (
+                    "⚠️ No reply: the token budget was exhausted immediately after a tool result, "
+                    "before the model could write the final answer. I stopped to avoid an infinite "
+                    "tool loop. Send `continue` to summarize from the existing tool results, or `/reset` "
+                    "to start a fresh session."
+                )
+            else:
+                final_response = (
+                    "⚠️ No reply: the turn stopped after a tool result before the model produced "
+                    "follow-up text. Send `continue` to summarize from the existing tool results, "
+                    "or `/reset` to start a fresh session."
+                )
+            messages.append({"role": "assistant", "content": final_response})
+            completed = api_call_count < agent.max_iterations and not failed
+            agent._persist_session(messages, conversation_history)
+
+    # Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log
     # at WARNING — this is the "just stops" scenario users report.

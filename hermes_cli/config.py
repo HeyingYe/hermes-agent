@@ -890,19 +890,24 @@ DEFAULT_CONFIG = {
     "max_concurrent_sessions": None,
     "agent": {
         "max_turns": 90,
-        # P5.1 token circuit breaker: cap total context tokens SENT
+        # P5.1 token circuit breaker: cap per-turn context tokens SENT
         # (prompt_tokens = input + cached input) to halt runaway loops that
         # re-send a huge context on every iteration — a failure mode the
         # iteration-count cap (max_turns) misses. Measured on prompt_tokens
         # because such loops are dominated by cache_read; uncached input stays
-        # tiny. 0 = unlimited for that scope; enabled=false disables the breaker.
+        # tiny. Session cumulative prompt tokens are recorded as telemetry only:
+        # they grow with useful long-running work and must not freeze a valid
+        # conversation. 0 = unlimited for that scope; enabled=false disables the
+        # breaker.
         "token_budget": {
             "enabled": True,
             "per_turn_prompt_tokens": 3000000,
             "per_session_prompt_tokens": 8000000,
             # P5.4 in-turn expensive-model (Opus) guard: while the ACTIVE model is
-            # in expensive_models, the smaller of the normal cap and these tighter
-            # caps applies — so an Opus grunt loop is cut sooner than a gpt-5.5 one.
+            # in expensive_models, the smaller of the normal cap and this tighter
+            # per-turn cap applies — so an Opus grunt loop is cut sooner than a
+            # gpt-5.5 one. The expensive per-session value is telemetry-only
+            # compatibility config, not a hard stop.
             # 0 = no separate expensive cap. (This is a tighter budget, NOT mid-turn
             # model-switching, which stays an architectural change.)
             "expensive_models": [
@@ -1315,6 +1320,15 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Optional event-driven notification hook for task completion. When
+        # enabled, ``complete_task()`` spawns this site-local command exactly
+        # once per successful ``-> done`` transition and passes task facts via
+        # ``HERMES_KANBAN_DONE_*`` environment variables. Empty command = off.
+        "done_notify": {
+            "enabled": False,
+            "command": "",
+            "allow_in_tests": False,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

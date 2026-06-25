@@ -121,7 +121,7 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
     assert m
     p = m.group(1)
     out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
-    assert "todo" in out2  # child starts as todo
+    assert "blocked-by-deps" in out2  # child starts blocked on its parent
 
     # Complete parent; list should promote child to ready
     kc.run_slash(f"complete {p}")
@@ -258,9 +258,9 @@ def test_run_slash_link_unlink(kanban_home):
     ta = re.search(r"(t_[a-f0-9]+)", a).group(1)
     tb = re.search(r"(t_[a-f0-9]+)", b).group(1)
     assert "Linked" in kc.run_slash(f"link {ta} {tb}")
-    # After link, b is todo
+    # After link, b is blocked-by-deps
     show = kc.run_slash(f"show {tb}")
-    assert "todo" in show
+    assert "blocked-by-deps" in show
     assert "Unlinked" in kc.run_slash(f"unlink {ta} {tb}")
 
 

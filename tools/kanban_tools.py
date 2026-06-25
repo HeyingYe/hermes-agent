@@ -1292,9 +1292,9 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Parent task ids. The new task stays in 'todo' "
-                    "until every parent reaches 'done'; then it "
-                    "auto-promotes to 'ready'. Typical fan-in: list "
+                    "Parent task ids. The new task stays in "
+                    "'blocked-by-deps' until every parent reaches 'done'; "
+                    "then it auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),

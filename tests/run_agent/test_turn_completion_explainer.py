@@ -136,6 +136,58 @@ def test_explainer_disabled_via_config():
             assert agent._turn_completion_explainer_enabled() is False
 
 
+def test_finalize_turn_pending_tool_token_budget_synthesizes_reply():
+    """Regression for gateway turns that end on a tool result with no text.
+
+    The real incident logged ``token_budget_exhausted:per_turn`` with
+    ``last_msg_role=tool`` and ``response_len=0``; finalization must produce a
+    deliverable response before gateway normalization turns it into the generic
+    stopped-after-tools warning.
+    """
+    from agent.turn_finalizer import finalize_turn
+
+    agent = _make_agent(max_iterations=150)
+    messages = [
+        {"role": "user", "content": "fix loop"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_sync_external_memory_for_turn"),
+    ):
+        result = finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=27,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=None,
+            effective_task_id="task-1",
+            turn_id="turn-1",
+            user_message="fix loop",
+            original_user_message="fix loop",
+            _should_review_memory=False,
+            _turn_exit_reason="token_budget_exhausted:per_turn",
+        )
+
+    assert result["turn_exit_reason"] == "token_budget_exhausted:per_turn"
+    assert result["final_response"]
+    assert "token budget was exhausted" in result["final_response"]
+    assert "continue" in result["final_response"]
+    assert result["completed"] is True
+
+
 # --------------------------------------------------------------------------
 # 3. End-to-end: empty-response exhaustion surfaces the explanation
 # --------------------------------------------------------------------------

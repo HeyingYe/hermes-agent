@@ -2199,9 +2199,55 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if api_calls > 0 and not agent_result.get("interrupted"):
+        error_detail = agent_result.get("error")
         if agent_result.get("partial"):
-            err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
+            return (
+                "⚠️ Processing stopped: "
+                f"{str(error_detail or 'processing incomplete')[:200]}. Try again."
+            )
+        # Preserve non-failed error details instead of falling through to the
+        # generic empty-response warning.
+        if error_detail:
+            return (
+                f"⚠️ Processing did not finish: {str(error_detail)[:200]}\n"
+                "Try again or use /reset to start a fresh session."
+            )
+        # ``completed is False`` means the loop stopped before producing a real
+        # final response; make that actionable for gateway users.
+        if agent_result.get("completed") is False:
+            return (
+                "⚠️ Processing stopped after using tools but produced no reply.\n"
+                "Try again or use /reset to start a fresh session."
+            )
+        # Sibling of the ``completed is False`` case. Some runtimes report
+        # ``completed=True`` (and omit ``interrupted``/``turn_exit_reason``)
+        # even when the model stopped after a tool batch without emitting a
+        # final reply — notably the codex app-server turn under gpt-5.5's
+        # null-output drift, where the transcript ends on a tool result and
+        # ``final_response`` is empty rather than None. Treat a transcript that
+        # ends on a tool result — or any turn that exited for a reason other
+        # than a clean text response — as the same "stopped after using tools"
+        # recurrence rather than a clean transient empty. Without this the run
+        # falls through to the generic retry message and silently drops the
+        # real reason it stopped mid-work.
+        result_messages = agent_result.get("messages") or []
+        last_role = (
+            result_messages[-1].get("role")
+            if result_messages and isinstance(result_messages[-1], dict)
+            else None
+        )
+        exit_reason = str(agent_result.get("turn_exit_reason") or "")
+        stopped_after_tools = last_role == "tool"
+        abnormal_exit = bool(exit_reason) and not exit_reason.startswith(
+            "text_response"
+        )
+        if stopped_after_tools or abnormal_exit:
+            return (
+                "⚠️ Processing stopped after using tools but produced no reply.\n"
+                "Try again or use /reset to start a fresh session."
+            )
+        # No usable evidence: the model finished cleanly yet emitted no text.
+        # A transient-retry hint is the honest fallback here.
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
@@ -15886,7 +15932,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _effective_history_offset = 0 if _session_was_split else len(agent_history)
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                # Keep the early return aligned with delivery-time
+                # normalization so empty runs preserve their real failure
+                # evidence instead of becoming the generic no-response warning.
+                error_msg = _normalize_empty_agent_response(
+                    result, "", history_len=len(agent_history),
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -15897,6 +15948,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
+                    # Carry the inner turn's exit reason so delivery-time
+                    # _normalize_empty_agent_response can classify abnormal_exit
+                    # (e.g. empty_response_exhausted / non-text_response) instead
+                    # of falling through to the generic no-response warning.
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": _effective_history_offset,
@@ -15998,6 +16054,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
+                # Carry the inner turn's exit reason through to delivery-time
+                # _normalize_empty_agent_response so the abnormal_exit branch is
+                # live on the real gateway path (not just in unit tests that
+                # inject the key directly).
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,

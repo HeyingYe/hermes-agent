@@ -204,11 +204,11 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
-def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
+def test_create_task_with_parent_is_blocked_by_deps_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
         c = kb.create_task(conn, title="child", parents=[p])
-        assert kb.get_task(conn, c).status == "todo"
+        assert kb.get_task(conn, c).status == "blocked-by-deps"
         kb.complete_task(conn, p, result="ok")
         assert kb.get_task(conn, c).status == "ready"
 
@@ -256,13 +256,13 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
 
-def test_link_demotes_ready_child_to_todo_when_parent_not_done(kanban_home):
+def test_link_demotes_ready_child_to_blocked_by_deps_when_parent_not_done(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         assert kb.get_task(conn, b).status == "ready"
         kb.link_tasks(conn, a, b)
-        assert kb.get_task(conn, b).status == "todo"
+        assert kb.get_task(conn, b).status == "blocked-by-deps"
 
 
 def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
@@ -299,7 +299,7 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         b = kb.create_task(conn, title="b", parents=[a])
         c = kb.create_task(conn, title="c", parents=[b])
         assert [kb.get_task(conn, x).status for x in (a, b, c)] == \
-               ["ready", "todo", "todo"]
+               ["ready", "blocked-by-deps", "blocked-by-deps"]
         kb.complete_task(conn, a)
         assert kb.get_task(conn, b).status == "ready"
         kb.complete_task(conn, b)
@@ -341,9 +341,41 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         b = kb.create_task(conn, title="b")
         c = kb.create_task(conn, title="c", parents=[a, b])
         kb.complete_task(conn, a)
-        assert kb.get_task(conn, c).status == "todo"
+        assert kb.get_task(conn, c).status == "blocked-by-deps"
         kb.complete_task(conn, b)
         assert kb.get_task(conn, c).status == "ready"
+
+
+def test_migrate_blocked_by_deps_relabels_dependency_waiting_todos(kanban_home):
+    """One-time migration re-labels legacy dependency-waiting 'todo' rows as
+    'blocked-by-deps'; parent-free 'todo' and failure-'blocked' rows are left
+    untouched. The pass is idempotent."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")  # 'ready' → not done
+        dep = kb.create_task(conn, title="dep", parents=[parent])
+        free = kb.create_task(conn, title="free")  # parent-free
+        blk = kb.create_task(conn, title="failed", assignee="a")
+        # Simulate a legacy DB: dependency-waiter + free task both sitting in
+        # the old generic 'todo', plus a failure-'blocked' row.
+        conn.execute(
+            "UPDATE tasks SET status='todo' WHERE id IN (?, ?)", (dep, free)
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=2 WHERE id=?",
+            (blk,),
+        )
+        conn.commit()
+
+        kb._migrate_blocked_by_deps_status(conn)
+
+        assert kb.get_task(conn, dep).status == "blocked-by-deps"  # undone parent
+        assert kb.get_task(conn, free).status == "todo"            # no parent → untouched
+        assert kb.get_task(conn, blk).status == "blocked"          # failure lane → untouched
+
+        # Idempotent: a second pass is a no-op.
+        kb._migrate_blocked_by_deps_status(conn)
+        assert kb.get_task(conn, dep).status == "blocked-by-deps"
+        assert kb.get_task(conn, free).status == "todo"
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +407,7 @@ def test_claim_fails_on_non_ready(kanban_home):
         # Move to todo by introducing an unsatisfied parent.
         p = kb.create_task(conn, title="p")
         kb.link_tasks(conn, p, t)
-        assert kb.get_task(conn, t).status == "todo"
+        assert kb.get_task(conn, t).status == "blocked-by-deps"
         assert kb.claim_task(conn, t) is None
 
 
@@ -395,11 +427,11 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         assert kb.schedule_task(conn, child, reason="wait until tomorrow") is True
 
         assert kb.unblock_task(conn, child) is True
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
 
         kb.complete_task(conn, parent)
         assert kb.schedule_task(conn, child, reason="second timer") is True
@@ -1334,7 +1366,7 @@ def test_claim_rejects_when_parents_not_done(kanban_home):
 
     Simulates the create-then-link race: a task gets status='ready' via a
     racy writer while it still has undone parents. The claim gate must
-    detect the violation, demote the child back to 'todo', append a
+    detect the violation, demote the child back to 'blocked-by-deps', append a
     'claim_rejected' event, and return None. Covers Fix 1 of the RCA.
     """
     with kb.connect() as conn:
@@ -1342,8 +1374,8 @@ def test_claim_rejects_when_parents_not_done(kanban_home):
         child = kb.create_task(
             conn, title="child", assignee="a", parents=[parent],
         )
-        # Child correctly starts 'todo' because parent is not 'done'.
-        assert kb.get_task(conn, child).status == "todo"
+        # Child correctly starts 'blocked-by-deps' because parent is not 'done'.
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         # Simulate the race: a racy writer force-promotes the child to
         # 'ready' while parent is still pending.
         conn.execute(
@@ -1356,7 +1388,7 @@ def test_claim_rejects_when_parents_not_done(kanban_home):
 
     assert result is None
     with kb.connect() as conn:
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         events = conn.execute(
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? ORDER BY id",
@@ -1384,19 +1416,19 @@ def test_claim_succeeds_once_parents_done(kanban_home):
     assert claimed.status == "running"
 
 
-def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
-    """kanban_create(parents=[...]) must land in 'todo' and only promote on parent done."""
+def test_create_with_parents_stays_blocked_by_deps_until_parents_done(kanban_home):
+    """kanban_create(parents=[...]) must land in 'blocked-by-deps' and only promote on parent done."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
             conn, title="child", assignee="a", parents=[parent],
         )
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         # Dispatcher tick between create and some later event must NOT
         # produce a winner for this child.
         promoted = kb.recompute_ready(conn)
         assert promoted == 0
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         # Complete parent; complete_task internally runs recompute_ready,
         # which promotes the child to 'ready'.
         kb.claim_task(conn, parent)
@@ -1404,12 +1436,12 @@ def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
+def test_unblock_with_pending_parents_goes_to_blocked_by_deps(kanban_home):
     """unblock_task must re-gate on parent completion (Fix 3).
 
     A task blocked while parents are still in progress must return to
-    'todo' (not 'ready') on unblock. Otherwise the dispatcher will claim
-    it immediately, repeating Bug 2 from the RCA.
+    'blocked-by-deps' (not 'ready') on unblock. Otherwise the dispatcher
+    will claim it immediately, repeating Bug 2 from the RCA.
     """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
@@ -1423,7 +1455,7 @@ def test_unblock_with_pending_parents_goes_to_todo(kanban_home):
         )
         conn.commit()
         assert kb.unblock_task(conn, child)
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         # After parent completes + recompute, the child is ready.
         kb.claim_task(conn, parent)
         kb.complete_task(conn, parent, result="ok")
@@ -1566,7 +1598,7 @@ def test_delete_task_cascades_links(kanban_home):
         p = kb.create_task(conn, title="parent")
         c = kb.create_task(conn, title="child", parents=[p])
         child = kb.get_task(conn, c)
-        assert child is not None and child.status == "todo"
+        assert child is not None and child.status == "blocked-by-deps"
         kb.delete_task(conn, p)
         assert kb.get_task(conn, p) is None
         child_after = kb.get_task(conn, c)
@@ -2886,9 +2918,9 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         c = kb.create_task(conn, title="parent-running")
         kb.claim_task(conn, c, claimer="worker:1")
 
-        # B depends on both A (done) and C (running) → stays todo.
+        # B depends on both A (done) and C (running) → stays blocked-by-deps.
         b = kb.create_task(conn, title="child", parents=[a, c])
-        assert kb.get_task(conn, b).status == "todo"
+        assert kb.get_task(conn, b).status == "blocked-by-deps"
 
         # Remove the blocking dependency C → B.
         removed = kb.unlink_tasks(conn, c, b)
@@ -2913,7 +2945,7 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
         parent = kb.create_task(conn, title="obsolete parent")
         child = kb.create_task(conn, title="child", parents=[parent])
 
-        assert kb.get_task(conn, child).status == "todo"
+        assert kb.get_task(conn, child).status == "blocked-by-deps"
         assert kb.archive_task(conn, parent) is True
 
         assert kb.get_task(conn, child).status == "ready", (

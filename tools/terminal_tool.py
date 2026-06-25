@@ -1682,6 +1682,10 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
         },
         # git: 1 is context-dependent but often normal (e.g. git diff with changes)
         "git":   {1: "Non-zero exit (often normal — e.g. 'git diff' returns 1 when files differ)"},
+        # claude (headless `claude -p` coding tool): 124=timed out before
+        # producing a final answer. Surface it as "did work but no text" rather
+        # than a silent failure, so the gpt-5.5 main loop doesn't drift empty.
+        "claude": {124: "claude -p timed out (rc124) before producing a final answer — retry or inspect the workspace (git diff/status)"},
     }
 
     cmd_semantics = semantics.get(base_cmd)
@@ -1689,6 +1693,22 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
         return cmd_semantics[exit_code]
 
     return None
+
+
+def _base_command_name(command: str) -> str:
+    """Best-effort base command name of the last pipeline segment.
+
+    Mirrors the extraction in :func:`_interpret_exit_code` so callers can scope
+    behavior to a specific tool (e.g. ``claude``) without re-implementing the
+    shell-operator split. Returns ``""`` when undeterminable.
+    """
+    segments = re.split(r'\s*(?:\|\||&&|[|;])\s*', command or "")
+    last_segment = (segments[-1] if segments else (command or "")).strip()
+    for w in last_segment.split():
+        if "=" in w and not w.startswith("-"):
+            continue  # skip VAR=val env assignments
+        return w.split("/")[-1]
+    return ""
 
 
 def _command_requires_pipe_stdin(command: str) -> bool:
@@ -2462,6 +2482,25 @@ def terminal_tool(
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")
             exit_note = _interpret_exit_code(command, returncode)
+
+            # When a command produced NO output, annotate the abnormal/agentic
+            # cases so the model isn't handed an indistinguishable empty result
+            # (a blank exit-0 `claude -p` is the detonator for the gpt-5.5
+            # empty-response drift). Scope tightly: never clobber a real
+            # exit_note, and never tag a benign silent exit-0 (cd, mkdir,
+            # git add, touch...) which would mislead the model into reading a
+            # clean success as abnormal.
+            if not exit_note and not output:
+                _base = _base_command_name(command)
+                if _base == "claude":
+                    exit_note = (
+                        f"claude -p exited {returncode} with no output — it likely "
+                        "did work but returned no final text (or got stuck during "
+                        "final reporting). Inspect the workspace (git diff/status) "
+                        "or retry; do not reply empty."
+                    )
+                elif returncode != 0:
+                    exit_note = f"Command exited {returncode} but produced no output."
 
             result_dict = {
                 "output": output,

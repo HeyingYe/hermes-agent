@@ -74,6 +74,16 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _start_patches(patches):
+    for p in patches:
+        p.start()
+
+
+def _stop_patches(patches):
+    for p in patches:
+        p.stop()
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -105,9 +115,9 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
-    assert root.status == "todo"
+    assert root.status == "blocked-by-deps"
     assert c0.status == "ready"
-    assert c1.status == "todo"
+    assert c1.status == "blocked-by-deps"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
 
@@ -290,6 +300,122 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         child = kb.get_task(conn, outcome.child_ids[0])
     # 'made_up' wasn't in roster, so assignee rewritten to 'fallback'
     assert child.assignee == "fallback"
+
+
+def test_decompose_adds_review_gate_for_risky_fanout(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Update gateway deployment automation",
+            body="Touches cron, gateway, and production-like launch configuration.",
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "implementation split",
+        "tasks": [
+            {"title": "patch config", "body": "change launchagent", "assignee": "engineer", "parents": []},
+            {"title": "run e2e", "body": "verify dashboard", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "jarvisreview"])
+    _start_patches(patches)
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "orchestrator_profile": "orchestrator",
+                    "default_assignee": "engineer",
+                    "review_gate": {"enabled": True},
+                }
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        _stop_patches(patches)
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 3
+    with kb.connect() as conn:
+        first = kb.get_task(conn, outcome.child_ids[0])
+        second = kb.get_task(conn, outcome.child_ids[1])
+        review = kb.get_task(conn, outcome.child_ids[2])
+        assert first is not None
+        assert second is not None
+        assert review is not None
+        links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links WHERE child_id = ?",
+            (review.id,),
+        ).fetchall()
+    assert first.status == "ready"
+    assert second.status == "blocked-by-deps"
+    assert review.assignee == "jarvisreview"
+    assert review.status == "blocked-by-deps"
+    assert {row["parent_id"] for row in links} == {second.id}
+
+
+def test_decompose_review_gate_can_be_disabled(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Deploy risky gateway change", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "implementation split",
+        "tasks": [
+            {"title": "deploy", "body": "production gateway", "assignee": "engineer", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "jarvisreview"])
+    _start_patches(patches)
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"review_gate": {"enabled": False}}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        _stop_patches(patches)
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.assignee == "engineer"
+
+
+def test_decompose_complex_single_task_routes_to_review(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Verify final delivery", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single verification pass",
+        "title": "Verify final delivery",
+        "body": "Review evidence, tests, diffs, and acceptance criteria before final signoff.",
+        "assignee": "engineer",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "jarvisreview"])
+    _start_patches(patches)
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "engineer"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        _stop_patches(patches)
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.assignee == "jarvisreview"
 
 
 def test_decompose_handles_malformed_llm_json(kanban_home):

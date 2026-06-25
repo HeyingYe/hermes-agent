@@ -76,6 +76,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -97,7 +98,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "blocked-by-deps", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1492,6 +1493,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _migrate_blocked_by_deps_status(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -1532,6 +1534,25 @@ def connect_closing(
             conn.close()
         except Exception:
             pass
+
+
+def _migrate_blocked_by_deps_status(conn: sqlite3.Connection) -> None:
+    """One-time data migration: re-label dependency-waiting ``todo`` tasks as
+    ``blocked-by-deps``.
+
+    Distinguishes "waiting on an unfinished parent dependency" from a plain
+    ``todo`` (awaiting promotion / manual hold). Idempotent — after the first
+    run the affected rows are no longer ``todo`` so a re-run is a no-op.
+    Failure-``blocked`` rows are left untouched: that status is the
+    circuit-breaker / manual-ops lane, not a dependency wait.
+    """
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked-by-deps' "
+        "WHERE status = 'todo' AND EXISTS ("
+        "  SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "  WHERE l.child_id = tasks.id AND p.status NOT IN ('done', 'archived')"
+        ")"
+    )
 
 
 def init_db(
@@ -2225,14 +2246,16 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                        # If any parent is not yet done, we wait on
+                        # dependencies — distinct from 'todo' (awaiting
+                        # promotion) and 'blocked' (failure / manual ops).
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
+                            task_status = "blocked-by-deps"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -2435,13 +2458,14 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
+        # If child was ready but parent is not yet done, demote child to
+        # blocked-by-deps (waiting on a dependency).
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
         if parent_status != "done":
             conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'blocked-by-deps' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
         _append_event(
@@ -2891,7 +2915,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` / ``blocked-by-deps`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -2925,7 +2949,7 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked-by-deps', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2967,7 +2991,8 @@ def recompute_ready(
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = 'ready' "
+                        "WHERE id = ? AND status IN ('todo', 'blocked-by-deps')",
                         (task_id,),
                     )
                 _append_event(conn, task_id, "promoted", None)
@@ -3000,8 +3025,8 @@ def claim_task(
         # regardless of which writer (create_task, link_tasks, unblock_task,
         # release_stale_claims, manual SQL) set status='ready'. If a racy
         # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
+        # 'blocked-by-deps' here — recompute_ready will re-promote when the
+        # parents actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
@@ -3011,7 +3036,7 @@ def claim_task(
         ).fetchone()
         if undone:
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
+                "UPDATE tasks SET status = 'blocked-by-deps' "
                 "WHERE id = ? AND status = 'ready'",
                 (task_id,),
             )
@@ -3577,6 +3602,176 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# ---------------------------------------------------------------------------
+# Event-driven task_done notification (replaces the polling cron notifier)
+# ---------------------------------------------------------------------------
+
+def _collapse_ws(text: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _shorten_text(text: Optional[str], limit: int = 72) -> str:
+    text = _collapse_ws(text)
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _summarize_command_title(text: str) -> Optional[str]:
+    """Best-effort human-readable summary of a raw shell / ``[bg]`` title.
+
+    Background tasks are created with the literal command line as their
+    title (e.g. ``[bg] bash .../jarvis_claude_code_runner.sh -p '...'``).
+    Surfacing that verbatim in a notification is noisy and can leak the
+    full prompt/flags. This collapses the common shapes into a short
+    label and returns ``None`` when the text isn't a command we know how
+    to summarize (so callers fall back to the raw title).
+    """
+    raw = _collapse_ws(text)
+    if not raw:
+        return None
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        parts = raw.split()
+    if not parts:
+        return None
+    if parts[0] == "[bg]":
+        parts = parts[1:]
+    # Drop leading ``FOO=bar`` env assignments so ``HERMES_HOME=... bash``
+    # still resolves to its underlying command.
+    while parts and "=" in parts[0] and not parts[0].startswith("-") and parts[0].split("=", 1)[0].isidentifier():
+        parts = parts[1:]
+    if not parts:
+        return None
+    if len(parts) >= 2 and parts[0] == "bash" and Path(parts[1]).name == "jarvis_claude_code_runner.sh":
+        prompt = None
+        for idx, part in enumerate(parts):
+            if part in {"-p", "--prompt"} and idx + 1 < len(parts):
+                prompt = parts[idx + 1]
+                break
+        if prompt:
+            return "Claude Code 后台任务：" + _shorten_text(prompt, 60)
+        return "Claude Code 后台任务"
+    executable = Path(parts[0]).name
+    if executable == "bash" and len(parts) > 1:
+        return f"后台脚本：{Path(parts[1]).name}"
+    return None
+
+
+def _humanize_task_title(title: Optional[str], body: Optional[str] = "") -> str:
+    """Return a human-readable title, summarizing raw command lines."""
+    title = _collapse_ws(title)
+    if title.startswith(("[bg]", "bash ", "python", "HERMES_HOME=")):
+        summary = _summarize_command_title(title) or _summarize_command_title(body or "")
+        if summary:
+            return summary
+    return title
+
+
+def _done_notify_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        notify_cfg = kanban_cfg.get("done_notify", {}) if isinstance(kanban_cfg, dict) else {}
+        return notify_cfg if isinstance(notify_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _done_notify_in_tests() -> bool:
+    cfg = _done_notify_config()
+    if bool(cfg.get("allow_in_tests")):
+        return True
+    val = os.environ.get("HERMES_KANBAN_DONE_NOTIFY_IN_TESTS", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _done_notify_command() -> str:
+    cfg = _done_notify_config()
+    if bool(cfg.get("enabled")):
+        cmd = str(cfg.get("command") or "").strip()
+        if cmd:
+            return cmd
+    return os.environ.get("HERMES_KANBAN_DONE_NOTIFY_CMD", "").strip()
+
+
+def _emit_task_done_notification(
+    conn: sqlite3.Connection,
+    task_id: str,
+    result: Optional[str],
+) -> None:
+    """Fire a single best-effort ``task_done`` notification.
+
+    Event-driven replacement for the polling cron notifier
+    (``jarvis_kanban_completion_idle_retry.py``). Invoked exactly once per
+    ``-> done`` transition from :func:`complete_task` — the ``rowcount == 1``
+    guard there makes the transition single-shot, so no dedup state file is
+    needed and the same task can never double-notify.
+
+    Delivery is delegated to a site-local command named by
+    ``HERMES_KANBAN_DONE_NOTIFY_CMD`` so core stays platform-agnostic and
+    carries no secrets. When that env var is empty the hook is a no-op
+    (feature OFF by default). Task facts are passed to the command through
+    the environment — never interpolated into the command string — so there
+    is no shell-injection surface. The command is spawned fire-and-forget;
+    any failure is swallowed so it can never block or fail a completion.
+
+    Skipped under pytest (``PYTEST_CURRENT_TEST``) unless
+    ``HERMES_KANBAN_DONE_NOTIFY_IN_TESTS`` is truthy, so the suite never
+    emits real notifications.
+    """
+    cmd = _done_notify_command()
+    if not cmd:
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST") and not _done_notify_in_tests():
+        return
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        argv = [cmd]
+    if not argv:
+        return
+    try:
+        row = conn.execute(
+            "SELECT title, body, assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    except Exception:
+        return
+    title_raw = (row["title"] if row else "") or ""
+    body_raw = (row["body"] if row else "") or ""
+    assignee = (row["assignee"] if row else "") or ""
+    human_title = _humanize_task_title(title_raw, body_raw) or task_id
+    summary = ""
+    if result:
+        lines = result.strip().splitlines()
+        if lines:
+            summary = _shorten_text(lines[0], 200)
+    child_env = dict(os.environ)
+    child_env["HERMES_KANBAN_DONE_TASK_ID"] = task_id
+    child_env["HERMES_KANBAN_DONE_TITLE"] = human_title
+    child_env["HERMES_KANBAN_DONE_ASSIGNEE"] = assignee
+    child_env["HERMES_KANBAN_DONE_SUMMARY"] = summary
+    try:
+        from hermes_constants import get_hermes_home
+        cwd = str(get_hermes_home())
+    except Exception:
+        cwd = None
+    try:
+        kwargs: dict[str, Any] = {
+            "env": child_env,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if cwd:
+            kwargs["cwd"] = cwd
+        if not _IS_WINDOWS:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(argv, **kwargs)  # fire-and-forget — never blocks completion
+    except Exception as exc:
+        _log.debug("task_done notify: spawn failed for %s: %s", task_id, exc)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3756,6 +3951,13 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    # Event-driven task_done notification (replaces the polling cron
+    # notifier). Best-effort and OFF unless HERMES_KANBAN_DONE_NOTIFY_CMD
+    # is configured; never raises into the completion path.
+    try:
+        _emit_task_done_notification(conn, task_id, result)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.debug("task_done notify: emit failed for %s: %s", task_id, exc)
     return True
 
 
@@ -4192,7 +4394,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked-by-deps` or `blocked` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -4209,10 +4411,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked-by-deps", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked-by-deps' or 'blocked'"
         )
 
     if not force:
@@ -4238,7 +4440,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked-by-deps', 'blocked')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -4254,7 +4456,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``blocked``/``scheduled`` -> ready or blocked-by-deps.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -4293,7 +4495,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        new_status = "blocked-by-deps" if undone_parents else "ready"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
@@ -4409,7 +4611,7 @@ def decompose_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
 ) -> Optional[list[str]]:
-    """Fan a triage task out into child tasks and promote the root to ``todo``.
+    """Fan a triage task out into child tasks and move the root to ``blocked-by-deps``.
 
     The root task stays alive and becomes the parent of every child —
     when all children reach ``done``, the root promotes to ``ready`` and
@@ -4509,15 +4711,19 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Create children. A child with sibling parents starts in
+        # 'blocked-by-deps' (waiting on a dependency); a parent-free child
+        # starts in 'todo'. We link them under the root AFTER creation so
+        # the dispatcher sees a coherent state, and recompute_ready() at the
+        # end promotes parent-free children ('todo') to 'ready'.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            # A child that depends on sibling(s) waits in blocked-by-deps;
+            # recompute_ready() promotes it to ready once those parents finish.
+            child_status = "blocked-by-deps" if child.get("parents") else "todo"
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -4534,12 +4740,13 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -4579,8 +4786,10 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
+        # Flip the root: triage -> blocked-by-deps (it depends on the whole
+        # child graph), set assignee to the orchestrator. recompute_ready()
+        # promotes it to 'ready' once every child reaches done/archived.
+        sets = ["status = 'blocked-by-deps'"]
         params: list[Any] = []
         if root_assignee is not None:
             sets.append("assignee = ?")
@@ -4788,7 +4997,7 @@ def schedule_task(
 
     ``scheduled`` tasks are intentionally not dispatchable; an external cron,
     human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    to ``ready`` (or ``blocked-by-deps`` if parents are still incomplete).
     """
     with write_txn(conn):
         params: list[Any] = [task_id]
@@ -4799,7 +5008,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'blocked-by-deps', 'ready', 'running', 'blocked')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -4868,6 +5077,11 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Idempotency prefix for automatically-created self-repair cards.  Keeping
+# this as a plain task idempotency key avoids schema growth while still making
+# retrying dispatcher ticks safe.
+SELF_REPAIR_IDEMPOTENCY_PREFIX = "self-repair"
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -4876,6 +5090,139 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+
+def _self_repair_config() -> dict[str, Any]:
+    """Return kanban self-repair settings with safe defaults."""
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config().get("kanban") or {})
+    except Exception:
+        kanban_cfg = {}
+    return {
+        "enabled": bool(kanban_cfg.get("self_repair_enabled", True)),
+        "assignee": (
+            str(
+                kanban_cfg.get("self_repair_assignee")
+                or kanban_cfg.get("default_assignee")
+                or "default"
+            ).strip()
+            or "default"
+        ),
+    }
+
+
+def _format_self_repair_body(
+    *,
+    source: Task,
+    error: str,
+    outcome: str,
+    failures: int,
+    effective_limit: int,
+    severity: str,
+    event_payload: dict[str, Any],
+) -> str:
+    metadata = {
+        "source_task_id": source.id,
+        "source_title": source.title,
+        "source_assignee": source.assignee,
+        "source_status": source.status,
+        "source_workspace_kind": source.workspace_kind,
+        "source_workspace_path": source.workspace_path,
+        "source_branch_name": source.branch_name,
+        "source_tenant": source.tenant,
+        "trigger_outcome": outcome,
+        "severity": severity,
+        "failures": failures,
+        "effective_limit": effective_limit,
+        "error": error[:500],
+        "event_payload": event_payload,
+    }
+    return (
+        "自动创建的 Hermes 自我修复任务。\n\n"
+        "目标：定位并修复导致源任务失败/阻塞的根因，修复完成后用 "
+        "kanban_complete 提交问题修复报告。报告必须包含：结果、核心工作、"
+        "问题原因、解决方案、后续避免、真实验证输出。\n\n"
+        f"源任务：{source.id} — {source.title}\n"
+        f"严重级别：{severity}\n"
+        f"触发结果：{outcome}\n"
+        f"连续失败：{failures}/{effective_limit}\n"
+        f"错误摘要：{error[:500]}\n\n"
+        "上下文 JSON：\n"
+        f"```json\n{json.dumps(metadata, ensure_ascii=False, indent=2)}\n```"
+    )
+
+
+def _ensure_self_repair_task(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    error: str,
+    outcome: str,
+    failures: int,
+    effective_limit: int,
+    severity: str = "blocking",
+    event_payload: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Create or reuse a Kanban task that repairs a failed source task."""
+    cfg = _self_repair_config()
+    if not cfg["enabled"]:
+        return None
+    source = get_task(conn, source_task_id)
+    if source is None:
+        return None
+    fingerprint = _error_fingerprint(f"{outcome}:{error}")[:16]
+    idempotency_key = (
+        f"{SELF_REPAIR_IDEMPOTENCY_PREFIX}:{source_task_id}:{severity}:{fingerprint}"
+    )
+    title = f"修复 Kanban 任务失败：{source.id} {source.title}"[:180]
+    body = _format_self_repair_body(
+        source=source,
+        error=error,
+        outcome=outcome,
+        failures=failures,
+        effective_limit=effective_limit,
+        severity=severity,
+        event_payload=event_payload or {},
+    )
+    repair_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=cfg["assignee"],
+        created_by="kanban-self-repair",
+        tenant=source.tenant,
+        priority=(source.priority or 0) + (100 if severity == "blocking" else 10),
+        idempotency_key=idempotency_key,
+        skills=["systematic-debugging"],
+        max_retries=1,
+        initial_status="running" if severity == "blocking" else "blocked",
+        session_id=source.session_id,
+    )
+    with write_txn(conn):
+        _append_event(
+            conn,
+            source_task_id,
+            "self_repair_task_created",
+            {
+                "repair_task_id": repair_id,
+                "severity": severity,
+                "outcome": outcome,
+                "error": error[:500],
+            },
+        )
+        _append_event(
+            conn,
+            repair_id,
+            "self_repair_source",
+            {
+                "source_task_id": source_task_id,
+                "severity": severity,
+                "outcome": outcome,
+            },
+        )
+    return repair_id
 
 
 @dataclass

@@ -21,7 +21,8 @@ def test_per_session_breach():
     tb = TokenBudget(per_turn_limit=0, per_session_limit=8_000_000)
     for _ in range(8):
         tb.add(1_000_000)
-    assert tb.breach() == "per_session"
+    assert tb.session_used == 8_000_000
+    assert tb.breach() is None
 
 
 def test_reset_turn_clears_turn_not_session():
@@ -35,13 +36,20 @@ def test_reset_turn_clears_turn_not_session():
 
 
 def test_session_breach_survives_turn_resets():
-    """The whole point of the session cap: many small turns still add up."""
+    """Session usage is telemetry only; many useful turns must not freeze chat."""
     tb = TokenBudget(per_turn_limit=3_000_000, per_session_limit=8_000_000)
     for _ in range(9):
         tb.add(1_000_000)
         tb.reset_turn()
     assert tb.session_used == 9_000_000
-    assert tb.breach() == "per_session"
+    assert tb.breach() is None
+
+
+def test_per_session_limit_is_observability_only():
+    tb = TokenBudget(per_turn_limit=0, per_session_limit=1)
+    tb.add(1_000_000)
+    assert tb.session_used == 1_000_000
+    assert tb.breach() is None
 
 
 def test_reset_session_clears_both():

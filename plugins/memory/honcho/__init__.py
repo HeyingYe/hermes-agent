@@ -679,64 +679,22 @@ class HonchoMemoryProvider(MemoryProvider):
         # is enforced.
 
         # ----- Layer 2: Dialectic supplement -----
-        # On the very first turn, no queue_prefetch() has run yet so the
-        # dialectic result is empty.  Run with a bounded timeout so a slow
-        # Honcho connection doesn't block the first response indefinitely.
-        # On timeout we let the thread keep running and write its result into
-        # _prefetch_result under the lock, so the next turn picks it up.
-        #
-        # Skip if the session-start prewarm already filled _prefetch_result —
-        # firing another .chat() would be duplicate work.
-        with self._prefetch_lock:
-            _prewarm_landed = bool(self._prefetch_result)
-        if _prewarm_landed and self._last_dialectic_turn == -999:
-            self._last_dialectic_turn = self._turn_count
-
-        if self._last_dialectic_turn == -999 and query:
-            _first_turn_timeout = (
-                self._config.timeout if self._config and self._config.timeout else 8.0
-            )
-            _fired_at = self._turn_count
-
-            def _run_first_turn() -> None:
-                try:
-                    r = self._run_dialectic_depth(query)
-                except Exception as exc:
-                    logger.debug("Honcho first-turn dialectic failed: %s", exc)
-                    self._dialectic_empty_streak += 1
-                    return
-                if r and r.strip():
-                    with self._prefetch_lock:
-                        self._prefetch_result = r
-                        self._prefetch_result_fired_at = _fired_at
-                    # Advance cadence only on a non-empty result so the next
-                    # turn retries when the call returned nothing.
-                    self._last_dialectic_turn = _fired_at
-                    self._dialectic_empty_streak = 0
-                else:
-                    self._dialectic_empty_streak += 1
-
-            self._prefetch_thread_started_at = time.monotonic()
-            first_turn_thread = threading.Thread(
-                target=_run_first_turn, daemon=True, name="honcho-prefetch-first"
-            )
-            first_turn_thread.start()
-            self._prefetch_thread = first_turn_thread
-            self._prefetch_thread.join(timeout=_first_turn_timeout)
-            if self._prefetch_thread.is_alive():
-                logger.debug(
-                    "Honcho first-turn dialectic still running after %.1fs — "
-                    "will surface on next turn",
-                    _first_turn_timeout,
-                )
-
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
+        # Dialectic uses Honcho peer.chat(), which is agentic LLM synthesis,
+        # not fast retrieval.  prefetch() is on the current-turn critical path,
+        # so it must NEVER start or join peer.chat() here.  It only consumes a
+        # result that a background prewarm/queue_prefetch thread has already
+        # written; if a thread is still running, current turn proceeds with
+        # base context only and the result is picked up by a later turn.
         with self._prefetch_lock:
             dialectic_result = self._prefetch_result
             fired_at = self._prefetch_result_fired_at
             self._prefetch_result = ""
             self._prefetch_result_fired_at = -999
+
+        if dialectic_result and self._last_dialectic_turn == -999:
+            # Defensive compatibility for tests/older background writers that
+            # populate the result slot without advancing cadence themselves.
+            self._last_dialectic_turn = fired_at if fired_at >= 0 else self._turn_count
 
         # Discard stale pending results: if the fire happened more than
         # cadence × multiplier turns ago (e.g. a run of trivial-prompt turns

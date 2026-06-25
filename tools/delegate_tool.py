@@ -1812,8 +1812,34 @@ def _run_single_child(
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
+        # A subagent turn that ran (often using its own tools) but produced no
+        # usable final text must NOT be reported as "completed": that masks the
+        # lost work from the parent. The empty turn surfaces either as a blank
+        # final_response, the literal "(empty)" sentinel
+        # (conversation_loop empty-retry exhaustion), or — when the
+        # turn-completion explainer is enabled (default) — as a rewritten
+        # explanation string carrying turn_exit_reason "empty_response_exhausted".
+        # Gate on the exit reason too so the explainer rewrite is still caught.
+        _stripped_summary = summary.strip()
+        _empty_turn = (
+            _stripped_summary == ""
+            or _stripped_summary == "(empty)"
+            or result.get("turn_exit_reason") == "empty_response_exhausted"
+        )
+
         if interrupted:
             status = "interrupted"
+        elif _empty_turn:
+            status = "failed"
+            if _stripped_summary and _stripped_summary != "(empty)":
+                # Preserve the explainer's human-readable reason as the error.
+                result.setdefault("error", _stripped_summary)
+            else:
+                result.setdefault(
+                    "error", "Subagent ran but produced no final text response."
+                )
+            # Don't pass "(empty)" downstream as if it were real output.
+            summary = ""
         elif summary:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already

@@ -142,6 +142,36 @@ async def test_empty_success_still_gets_empty_response_warning(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_empty_incomplete_turn_gets_actionable_diagnostic(monkeypatch, tmp_path):
+    """A turn that used tools but stopped without completing (completed=False,
+    no error/partial/interrupted) must surface an actionable diagnostic, not
+    the generic 'no response was generated' transient message."""
+    runner = _runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "",
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": ""},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 6,
+        "failed": False,
+        "partial": False,
+        "interrupted": False,
+        "completed": False,
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert "no response was generated" not in response
+    assert "/reset" in response
+
+
+@pytest.mark.asyncio
 async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
     text = "Use [SILENT] when no answer is needed."

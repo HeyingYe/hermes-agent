@@ -7,8 +7,8 @@ task graphs. After each step, checks the full invariant set:
       ended_at MUST be NULL (we never point at a closed run).
   I2. If a run has ended_at NULL, SOME task MUST have current_run_id
       pointing at it (no orphan open runs).
-  I3. task.status in the valid set {triage, todo, ready, running,
-      blocked, done, archived}.
+  I3. task.status in the valid set {triage, todo, blocked-by-deps, ready,
+      running, blocked, done, archived}.
   I4. task.claim_lock NULL iff status not in (running,).
   I5. Every run has started_at <= ended_at (or ended_at is NULL).
   I6. If outcome is set, ended_at must also be set.
@@ -16,8 +16,8 @@ task graphs. After each step, checks the full invariant set:
   I8. task_events.run_id references a task_runs.id that exists
       (or is NULL).
   I9. Parent completion invariant: if all parents are 'done', the
-      child cannot be in 'todo' status (recompute_ready should have
-      promoted it). This is called out in the comment on
+      child cannot be in 'todo' or 'blocked-by-deps' status
+      (recompute_ready should have promoted it). This is called out in the comment on
       recompute_ready; verify it holds after every random seq.
 
 Not using hypothesis the lib; just Python random for simplicity.
@@ -74,7 +74,7 @@ def assert_invariants(conn, kb, ops_log):
         failures.append(f"I2: open run {row['id']} on task {row['task_id']} has no pointer")
 
     # I3: valid statuses
-    valid = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
+    valid = {"triage", "todo", "blocked-by-deps", "ready", "running", "blocked", "done", "archived"}
     bad_status = conn.execute("SELECT id, status FROM tasks").fetchall()
     for row in bad_status:
         if row["status"] not in valid:
@@ -129,13 +129,14 @@ def assert_invariants(conn, kb, ops_log):
         FROM tasks c
         JOIN task_links l ON l.child_id = c.id
         JOIN tasks p ON p.id = l.parent_id
-        WHERE c.status = 'todo'
+        WHERE c.status IN ('todo', 'blocked-by-deps')
         GROUP BY c.id
         HAVING n_parents > 0 AND n_parents = done_parents
     """).fetchall()
     for row in orphaned_todo:
         failures.append(
-            f"I9: task {row['child_id']} is todo but all {row['n_parents']} parents are done"
+            f"I9: task {row['child_id']} is todo/blocked-by-deps but all "
+            f"{row['n_parents']} parents are done"
         )
 
     if failures:

@@ -236,6 +236,66 @@ def _permission_denied(message_id: Any) -> dict[str, Any]:
     }
 
 
+def _synthesize_empty_turn_note(
+    stop_reason: Any,
+    meta: dict[str, Any] | None,
+    reasoning_text: str,
+) -> str:
+    """Turn a *silent* empty ACP turn into an honest, non-empty status line.
+
+    The ACP receiving layer only aggregates ``agent_message_chunk`` text. A
+    Claude Code turn that does its work through the engine's own built-in tools
+    and ends (``stopReason=end_turn``) without a trailing text chunk — or whose
+    tool use was permission-declined, or that stopped for ``max_tokens`` /
+    ``refusal`` — leaves ``text_parts`` empty. Returning ``""`` here makes the
+    turn look like a clean empty response: the conversation loop burns its
+    empty-retry budget (every retry reproduces the same *deterministic* empty)
+    and finally surfaces the bland gateway "Processing completed but no response
+    was generated" message, hiding the fact that real work happened. The output
+    was effectively produced upstream but never received into ``final_response``.
+
+    Returning a short, truthful note instead (a) stops the wasted retries,
+    (b) lets the outer agent see that work occurred and continue, and (c) tells
+    the user what actually happened. Only fires when there is POSITIVE evidence
+    (tool activity, a declined permission, or a non-``end_turn`` stop reason);
+    a genuinely empty ``end_turn`` with no activity still returns ``""`` so the
+    existing transient-empty retry/fallback path is preserved unchanged.
+    """
+    meta = meta or {}
+    sr = str(stop_reason or "").strip()
+    blocked = meta.get("blocked_tools") or []
+    tools = meta.get("tools") or []
+
+    if meta.get("permission_cancelled"):
+        detail = f" (requested: {', '.join(blocked)})" if blocked else ""
+        return (
+            "⚠️ Claude Code requested permission to use a tool and Hermes "
+            f"auto-declined it{detail}, so the turn ended before producing a "
+            "final reply. Enable route_decision.acp_disable_builtin_tools so "
+            "Hermes drives the tools itself, or grant the tool, then retry."
+        )
+
+    if meta.get("saw_tool_activity"):
+        detail = f" ({', '.join(tools)})" if tools else ""
+        sr_note = f" [stopReason={sr}]" if sr and sr != "end_turn" else ""
+        return (
+            "⚠️ Claude Code executed tool actions this turn"
+            f"{detail} but returned no final text message{sr_note}. "
+            "The actions above ran; ask it to summarize the result if a "
+            "written reply is needed."
+        )
+
+    if sr and sr not in ("end_turn", ""):
+        return (
+            f"⚠️ Claude Code ended the turn with stopReason={sr} and produced "
+            "no text output."
+        )
+
+    # No positive evidence of work — treat as a genuine (possibly transient)
+    # empty and let the conversation loop's empty-retry / fallback path run.
+    return ""
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -1133,6 +1193,10 @@ class CopilotACPClient:
         reasoning + parse ``PromptResponse.usage``."""
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        # Per-turn signal sink: ``_handle_server_message`` records tool activity
+        # and declined permissions here so an empty turn can be diagnosed rather
+        # than surfaced as a silent "no response". Mutated by reference.
+        meta: dict[str, Any] = {}
         params: dict[str, Any] = {
             "sessionId": session_id,
             "prompt": [{"type": "text", "text": prompt_text}],
@@ -1146,16 +1210,29 @@ class CopilotACPClient:
             timeout_seconds=timeout_seconds,
             text_parts=text_parts,
             reasoning_parts=reasoning_parts,
+            meta=meta,
         )
         # ``PromptResponse.usage`` (claude-agent-acp >=0.48; UNSTABLE field) carries
         # real per-turn tokens incl. cache reads — the only truthful usage signal on
         # the ACP path. Absent (Copilot / old claude-code-acp) -> None -> zeros.
+        # ``stopReason`` was previously ignored entirely; we now read it so an
+        # empty turn can be told apart from a clean text response.
         acp_usage = None
+        stop_reason = None
         if isinstance(prompt_result, dict):
             _u = prompt_result.get("usage")
             if isinstance(_u, dict):
                 acp_usage = _u
-        return "".join(text_parts), "".join(reasoning_parts), acp_usage
+            stop_reason = prompt_result.get("stopReason")
+        text = "".join(text_parts)
+        reasoning = "".join(reasoning_parts)
+        if not text:
+            # The ACP layer aggregated no assistant text. If the turn actually
+            # did work (tools) / was permission-blocked / stopped abnormally,
+            # return an honest note instead of "" so the conversation loop does
+            # not mistake a deterministic structural empty for a transient one.
+            text = _synthesize_empty_turn_note(stop_reason, meta, reasoning)
+        return text, reasoning, acp_usage
 
     def _select_session_model(
         self,
@@ -1237,6 +1314,7 @@ class CopilotACPClient:
         timeout_seconds: float,
         text_parts: list[str] | None = None,
         reasoning_parts: list[str] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> Any:
         proc = conn.proc
         if proc is None or proc.stdin is None:
@@ -1267,6 +1345,7 @@ class CopilotACPClient:
                 cwd=conn.cwd,
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                meta=meta,
             ):
                 continue
 
@@ -1307,6 +1386,7 @@ class CopilotACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        meta: dict[str, Any] | None = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -1320,10 +1400,33 @@ class CopilotACPClient:
             chunk_text = ""
             if isinstance(content, dict):
                 chunk_text = str(content.get("text") or "")
+            elif isinstance(content, list):
+                # Defensive: today's claude-code-acp / Copilot adapters always
+                # emit ``content`` as a single content-block dict, but the ACP
+                # ContentBlock union also permits a list. Tolerate it so a future
+                # adapter change can't silently drop the turn's assistant text.
+                chunk_text = "".join(
+                    str(b.get("text") or "")
+                    for b in content
+                    if isinstance(b, dict)
+                )
             if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
                 text_parts.append(chunk_text)
             elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
                 reasoning_parts.append(chunk_text)
+            elif kind in ("tool_call", "tool_call_update", "plan") and meta is not None:
+                # The turn is doing real work via the engine's own built-in
+                # tools. Record it so a turn that ends without a trailing text
+                # chunk is surfaced as "ran tools but produced no final text"
+                # instead of a silent empty response.
+                meta["saw_tool_activity"] = True
+                title = ""
+                if isinstance(update, dict):
+                    title = str(update.get("title") or update.get("kind") or "").strip()
+                if title:
+                    tools = meta.setdefault("tools", [])
+                    if title not in tools and len(tools) < 8:
+                        tools.append(title)
             return True
 
         if process.stdin is None:
@@ -1333,6 +1436,21 @@ class CopilotACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
+            # Conservative default: decline. But record the decline so a turn
+            # that ends empty because its tool use was aborted can say so
+            # instead of surfacing a silent "no response". (Auto-allowing is
+            # deliberately NOT done here: the engine runs Bash internally with
+            # no Hermes-side guard, so blanket-allow would widen the real
+            # execution surface.)
+            if meta is not None:
+                meta["permission_cancelled"] = True
+                tc = params.get("toolCall") if isinstance(params, dict) else None
+                if isinstance(tc, dict):
+                    _t = str(tc.get("title") or tc.get("kind") or "").strip()
+                    if _t:
+                        blocked = meta.setdefault("blocked_tools", [])
+                        if _t not in blocked and len(blocked) < 8:
+                            blocked.append(_t)
             response = _permission_denied(message_id)
         elif method == "fs/read_text_file":
             try:

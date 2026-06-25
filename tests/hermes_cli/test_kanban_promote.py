@@ -47,7 +47,7 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
     child_id = kb.create_task(
         conn, title="child", parents=parent_ids, assignee="setup"
     )
-    assert kb.get_task(conn, child_id).status == "todo"
+    assert kb.get_task(conn, child_id).status == "blocked-by-deps"
     if parents_done:
         for pid in parent_ids:
             conn.execute(
@@ -69,7 +69,7 @@ def test_promote_refuses_when_parent_not_done(conn):
     assert ok is False
     assert err is not None and "unsatisfied parent dependencies" in err
     assert parents[0] in err
-    assert kb.get_task(conn, child).status == "todo"
+    assert kb.get_task(conn, child).status == "blocked-by-deps"
 
 
 def test_promote_with_force_bypasses_dependency_check(conn):
@@ -119,7 +119,7 @@ def test_promote_dry_run_does_not_mutate(conn):
     child, _ = _stuck_todo(conn, parents_done=True)
     ok, err = kb.promote_task(conn, child, actor="tester", dry_run=True)
     assert ok and err is None
-    assert kb.get_task(conn, child).status == "todo"
+    assert kb.get_task(conn, child).status == "blocked-by-deps"
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM task_events "
         "WHERE task_id = ? AND kind = 'promoted_manual'",
