@@ -4,6 +4,47 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Jarvis Local Architecture Guard — MUST FOLLOW
+
+This checkout is Boss's Jarvis fork of Hermes Agent. Jarvis must stay easy to
+synchronize with `upstream/main`; therefore every future Jarvis/Hermes code
+change is constrained by this rule:
+
+> **Keep Hermes core thin. Put Jarvis-local capability at the edges: plugins,
+> sidecars, profiles, cron jobs, skills, scripts, or MCP servers. Only generic,
+> upstreamable reliability fixes belong in core.**
+
+Before editing code, classify the change:
+
+1. **Upstreamable core fix** — generic bug fix or reliability improvement that
+   benefits Hermes broadly. Allowed in core only with tests and, when behavior
+   changes, config/default compatibility notes.
+2. **Jarvis-local product behavior** — Boss/workspace-specific workflows such as
+   Feishu routing rules, Kanban automation, Dashboard behavior, weekly pushes,
+   self-repair policies, or Claude Code worker orchestration. These MUST default
+   to plugin/sidecar/profile/cron/skill/script, not `agent/conversation_loop.py`,
+   `run_agent.py`, `model_tools.py`, `toolsets.py`, `gateway/run.py`, or global
+   config plumbing.
+3. **Experimental/deprecated path** — especially ACP-as-primary-model or other
+   routes we moved away from. Keep disabled, isolated, or archived; do not wire
+   them into the main runtime path.
+4. **Local ops/state** — scripts, cron prompts, profile config, Lark/Feishu
+   workspace glue. Keep `HERMES_HOME`-aware and out of core.
+
+Mandatory gate for core-touching changes:
+
+- Explain why the change cannot live in a plugin/sidecar/profile/cron/skill.
+- Preserve prompt-cache stability, strict role alternation, and stable toolsets.
+- Do not add new default model tools unless it passes the Footprint Ladder below.
+- Put non-secret behavior in `config.yaml`; `.env` is for credentials only.
+- Use `get_hermes_home()` / profile-aware paths; never hardcode `~/.hermes`.
+- Add behavior-contract tests and run the relevant pytest targets with real output.
+- Update `SELF_ARCHITECTURE.md` whenever the runtime architecture changes.
+- Run `python scripts/jarvis_architecture_guard.py` before committing or handing
+  off a Hermes/Jarvis code change.
+
+If there is a conflict between speed and this guard, this guard wins.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a

@@ -10,8 +10,8 @@ def test_no_limits_never_breaches():
 
 
 def test_per_turn_breach_at_limit():
-    tb = TokenBudget(per_turn_limit=3_000_000, per_session_limit=0)
-    tb.add(2_999_999)
+    tb = TokenBudget(per_turn_limit=10_000_000, per_session_limit=0)
+    tb.add(9_999_999)
     assert tb.breach() is None
     tb.add(1)  # now == limit
     assert tb.breach() == "per_turn"
@@ -26,18 +26,18 @@ def test_per_session_breach():
 
 
 def test_reset_turn_clears_turn_not_session():
-    tb = TokenBudget(per_turn_limit=3_000_000, per_session_limit=8_000_000)
-    tb.add(3_000_000)
+    tb = TokenBudget(per_turn_limit=10_000_000, per_session_limit=8_000_000)
+    tb.add(10_000_000)
     assert tb.breach() == "per_turn"
     tb.reset_turn()
     assert tb.turn_used == 0
-    assert tb.session_used == 3_000_000
-    assert tb.breach() is None  # turn cleared, session 3M < 8M
+    assert tb.session_used == 10_000_000
+    assert tb.breach() is None  # turn cleared; session total is telemetry only
 
 
 def test_session_breach_survives_turn_resets():
     """Session usage is telemetry only; many useful turns must not freeze chat."""
-    tb = TokenBudget(per_turn_limit=3_000_000, per_session_limit=8_000_000)
+    tb = TokenBudget(per_turn_limit=10_000_000, per_session_limit=8_000_000)
     for _ in range(9):
         tb.add(1_000_000)
         tb.reset_turn()
@@ -53,7 +53,7 @@ def test_per_session_limit_is_observability_only():
 
 
 def test_reset_session_clears_both():
-    tb = TokenBudget(per_turn_limit=3_000_000, per_session_limit=8_000_000)
+    tb = TokenBudget(per_turn_limit=10_000_000, per_session_limit=8_000_000)
     tb.add(5_000_000)
     tb.reset_session()
     assert tb.turn_used == 0
@@ -79,13 +79,13 @@ def test_non_positive_add_ignored():
 
 def test_expensive_cap_is_tighter():
     tb = TokenBudget(
-        per_turn_limit=3_000_000,
+        per_turn_limit=10_000_000,
         per_session_limit=8_000_000,
-        expensive_per_turn_limit=1_500_000,
+        expensive_per_turn_limit=5_000_000,
         expensive_per_session_limit=4_000_000,
         expensive_models=["claude-opus-4-8"],
     )
-    tb.add(1_600_000)  # under normal cap, over expensive cap
+    tb.add(5_100_000)  # under normal cap, over expensive cap
     assert tb.breach(expensive=False) is None
     assert tb.breach(expensive=True) == "per_turn"
 
@@ -101,10 +101,10 @@ def test_is_expensive_membership():
 def test_expensive_cap_applies_when_normal_unlimited():
     tb = TokenBudget(
         per_turn_limit=0,  # unlimited normally
-        expensive_per_turn_limit=1_500_000,
+        expensive_per_turn_limit=5_000_000,
         expensive_models=["claude-opus-4-8"],
     )
-    tb.add(1_500_000)
+    tb.add(5_000_000)
     assert tb.breach(expensive=False) is None
     assert tb.breach(expensive=True) == "per_turn"
 
@@ -112,9 +112,9 @@ def test_expensive_cap_applies_when_normal_unlimited():
 def test_default_breach_is_non_expensive():
     """Backward-compat: breach() with no arg behaves as expensive=False."""
     tb = TokenBudget(
-        per_turn_limit=3_000_000,
-        expensive_per_turn_limit=1_000_000,
+        per_turn_limit=10_000_000,
+        expensive_per_turn_limit=5_000_000,
         expensive_models=["claude-opus-4-8"],
     )
-    tb.add(2_000_000)
-    assert tb.breach() is None  # under the 3M normal cap
+    tb.add(6_000_000)
+    assert tb.breach() is None  # under the 10M normal cap

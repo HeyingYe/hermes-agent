@@ -4444,6 +4444,7 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
+        assert result["error_code"] == "tool_call_truncated"
         assert "truncated due to output length limit" in result["error"]
         mock_handle_function_call.assert_not_called()
 

@@ -171,6 +171,16 @@ _FALLBACK_TURN_MAX_CHARS = 700
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
+# Bounds for the serialized transcript sent to the LLM summarizer. Per-message
+# truncation alone is not enough: a compression window with 100+ tool-heavy
+# messages can still produce a huge summarizer prompt and time out before any
+# useful summary is generated. Derive the input budget from the compression
+# model's context window, but keep a latency-oriented ceiling so "compression
+# success" means an actual LLM summary, not the deterministic fallback path.
+_SUMMARY_INPUT_CONTEXT_RATIO = 0.12
+_SUMMARY_INPUT_MIN_TOKENS = 32_000
+_SUMMARY_INPUT_MAX_TOKENS = 160_000
+_SUMMARY_INPUT_HEAD_RATIO = 0.15
 # Keep a short run of recent messages verbatim even when the token budget is
 # already exhausted.  The public ``protect_last_n`` default is intentionally
 # high for small/light tails, but using all 20 as a hard floor here would bring
@@ -1030,6 +1040,90 @@ class ContextCompressor(ContextEngine):
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
 
+    def _summary_input_char_budget(self) -> tuple[int, int, int]:
+        """Return total/head/tail char budgets for the summarizer input.
+
+        Budget is derived from the compression model context window. We reserve
+        most of that window for the summarizer instructions, the generated
+        summary, provider overhead, and latency headroom; then convert the
+        remaining input allowance to rough characters.
+        """
+        context_tokens = max(MINIMUM_CONTEXT_LENGTH, int(self.context_length or 0))
+        input_tokens = int(context_tokens * _SUMMARY_INPUT_CONTEXT_RATIO)
+        input_tokens = max(
+            _SUMMARY_INPUT_MIN_TOKENS,
+            min(input_tokens, _SUMMARY_INPUT_MAX_TOKENS),
+        )
+        total_chars = input_tokens * _CHARS_PER_TOKEN
+        head_chars = max(4_000, int(total_chars * _SUMMARY_INPUT_HEAD_RATIO))
+        tail_chars = max(8_000, total_chars - head_chars)
+        return total_chars, head_chars, tail_chars
+
+    def _fit_summary_input_parts(self, parts: List[str]) -> str:
+        """Join serialized turns while bounding total summarizer input size.
+
+        The newest turns in the compression window are usually most important
+        for continuity, so reserve most of the budget for the tail while keeping
+        a small head slice for origin/goal context. The omitted middle has
+        already gone through old-tool-result pruning before ``compress()`` calls
+        the summarizer, and the marker makes the loss explicit to the LLM.
+        """
+        separator = "\n\n"
+        full = separator.join(parts)
+        max_chars, head_budget, tail_budget = self._summary_input_char_budget()
+        if len(full) <= max_chars:
+            return full
+
+        head_count = 0
+        head_chars = 0
+        for part in parts:
+            part_chars = len(part) + (len(separator) if head_count else 0)
+            if head_count and head_chars + part_chars > head_budget:
+                break
+            if not head_count and len(part) > head_budget:
+                break
+            head_chars += part_chars
+            head_count += 1
+
+        tail_start = len(parts)
+        tail_chars = 0
+        while tail_start > head_count:
+            part = parts[tail_start - 1]
+            part_chars = len(part) + (len(separator) if tail_chars else 0)
+            if tail_chars and tail_chars + part_chars > tail_budget:
+                break
+            if not tail_chars and len(part) > tail_budget:
+                break
+            tail_chars += part_chars
+            tail_start -= 1
+
+        # Degenerate case: one giant serialized turn. Keep a bounded head/tail
+        # of that single part instead of returning an unbounded prompt.
+        if head_count == 0 and tail_start == len(parts):
+            text = full
+            head = text[:head_budget]
+            tail = text[-tail_budget:]
+            omitted = max(0, len(text) - len(head) - len(tail))
+            return (
+                head
+                + f"\n\n[... {omitted:,} characters omitted to keep the compression summarizer request bounded ...]\n\n"
+                + tail
+            )
+
+        kept_parts = parts[:head_count]
+        omitted_count = max(0, tail_start - head_count)
+        if omitted_count:
+            omitted_chars = sum(len(p) for p in parts[head_count:tail_start])
+            kept_parts.append(
+                "[... "
+                f"{omitted_count:,} middle turn(s), ~{omitted_chars:,} chars, "
+                "omitted to keep the compression summarizer request bounded. "
+                "Use this as reference-only gap metadata; do not invent details from the omitted span."
+                " ...]"
+            )
+        kept_parts.extend(parts[tail_start:])
+        return separator.join(kept_parts)
+
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
 
@@ -1084,7 +1178,7 @@ class ContextCompressor(ContextEngine):
                 content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
-        return "\n\n".join(parts)
+        return self._fit_summary_input_parts(parts)
 
     def _build_static_fallback_summary(
         self,

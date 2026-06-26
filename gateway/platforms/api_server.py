@@ -1979,6 +1979,7 @@ class APIServerAdapter(BasePlatformAdapter):
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
         err_msg = result.get("error")
+        hermes_error_code = result.get("error_code")
 
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
@@ -2009,6 +2010,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
+                "error_code": hermes_error_code or "agent_incomplete",
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
@@ -2044,7 +2046,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                "error_code": hermes_error_code
+                or ("output_truncated" if finish_reason == "length" else "agent_error"),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"

@@ -502,8 +502,8 @@ def _ensure_token_budget(agent):
     tb = getattr(agent, "token_budget", None)
     if tb is not None:
         return tb
-    enabled, per_turn, per_session = True, 3_000_000, 8_000_000
-    exp_per_turn, exp_per_session, exp_models = 1_500_000, 4_000_000, ()
+    enabled, per_turn, per_session = True, 10_000_000, 8_000_000
+    exp_per_turn, exp_per_session, exp_models = 5_000_000, 4_000_000, ()
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -1800,6 +1800,7 @@ def run_conversation(
                                 "completed": False,
                                 "partial": True,
                                 "error": "Response remained truncated after 3 continuation attempts",
+                                "error_code": "final_text_truncated",
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -1859,6 +1860,11 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
+                                "error_code": (
+                                    "tool_call_stream_interrupted"
+                                    if _is_stub_stall
+                                    else "tool_call_truncated"
+                                ),
                                 "error": (
                                     "Stream repeatedly dropped mid tool-call (network); "
                                     "the tool was not executed"
@@ -1881,7 +1887,8 @@ def run_conversation(
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit"
+                            "error": "Response truncated due to output length limit",
+                            "error_code": "response_truncated",
                         }
                     else:
                         # First message was truncated - mark as failed
@@ -1894,7 +1901,8 @@ def run_conversation(
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": "First response truncated due to output length limit"
+                            "error": "First response truncated due to output length limit",
+                            "error_code": "response_truncated",
                         }
                 
                 # Track actual token usage from response for context management

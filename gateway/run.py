@@ -2201,6 +2201,21 @@ def _normalize_empty_agent_response(
     if api_calls > 0 and not agent_result.get("interrupted"):
         error_detail = agent_result.get("error")
         if agent_result.get("partial"):
+            error_code = str(agent_result.get("error_code") or "")
+            if error_code == "final_text_truncated":
+                return (
+                    "⚠️ The model's final text kept hitting the output limit, "
+                    "but no unsafe tool action was executed.\n"
+                    "Ask me to continue with a shorter summary, or start a fresh turn "
+                    "focused on the remaining deliverable."
+                )
+            if error_code in {"tool_call_truncated", "tool_call_stream_interrupted"}:
+                return (
+                    "⚠️ Processing stopped because a tool call was cut off before its "
+                    "arguments were complete. No partial tool action was executed.\n"
+                    "Try again with a smaller step, or ask me to continue by writing "
+                    "large content to files/artifacts instead of one huge tool call."
+                )
             return (
                 "⚠️ Processing stopped: "
                 f"{str(error_detail or 'processing incomplete')[:200]}. Try again."

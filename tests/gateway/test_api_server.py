@@ -2882,6 +2882,7 @@ class TestChatCompletionsAgentIncomplete:
             "completed": False,
             "partial": True,
             "error": "Response truncated due to output length limit",
+            "error_code": "final_text_truncated",
             "messages": [],
             "api_calls": 1,
         }
@@ -2899,7 +2900,7 @@ class TestChatCompletionsAgentIncomplete:
             assert data["choices"][0]["message"]["content"] == "Here is part one of the answer"
             assert data["hermes"]["partial"] is True
             assert data["hermes"]["completed"] is False
-            assert data["hermes"]["error_code"] == "output_truncated"
+            assert data["hermes"]["error_code"] == "final_text_truncated"
             assert resp.headers.get("X-Hermes-Completed") == "false"
             assert resp.headers.get("X-Hermes-Partial") == "true"
 
@@ -2935,6 +2936,7 @@ class TestChatCompletionsAgentIncomplete:
             assert "truncated" in data["error"]["message"].lower()
             assert data["error"]["hermes"]["partial"] is True
             assert data["error"]["hermes"]["failed"] is True
+            assert data["error"]["hermes"]["error_code"] == "agent_incomplete"
             assert resp.headers.get("X-Hermes-Completed") == "false"
 
     @pytest.mark.asyncio

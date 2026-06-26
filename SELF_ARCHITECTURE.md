@@ -49,6 +49,31 @@ alternation** (never two same-role messages in a row; no synthetic user message
 injected mid-loop) and a **byte-stable system prompt** for the life of a
 conversation.
 
+### Jarvis fork rule — staying syncable with upstream
+
+This checkout is Boss's Jarvis fork, so my self-modification rule is stricter
+than "make it work": **keep Hermes core thin and keep Jarvis-local behavior at
+the edges**. For every future Jarvis/Hermes code change I must first classify it:
+
+1. **Upstreamable core fix** — generic reliability/bug fix that belongs in Hermes
+   core and can plausibly be carried upstream.
+2. **Jarvis-local product behavior** — Feishu/Lark workspace policy, Kanban
+   automation, Dashboard behavior, scheduled pushes, self-repair policy, Claude
+   Code worker orchestration, or Boss-specific workflow. These default to
+   plugin/sidecar/profile/cron/skill/script, not the agent loop or global tool
+   schema.
+3. **Experimental/deprecated path** — especially ACP-as-primary-model paths that
+   are not the current architecture. Keep isolated/disabled/archived unless Boss
+   explicitly reopens them.
+4. **Local ops/state** — scripts, cron prompts, profile config, local glue. Keep
+   `HERMES_HOME`-aware and profile-safe.
+
+Core-touching changes must pass the guard in `AGENTS.md`: explain why the change
+cannot live at the edge, preserve prompt caching/role alternation/toolset
+stability, config-gate behavior, add behavior-contract tests, run real
+verification, and update this file when runtime architecture changes. Use
+`python scripts/jarvis_architecture_guard.py` before handing off a code change.
+
 ### My surfaces (all share the same `AIAgent` core)
 
 | Surface | Entry | Backend it drives |
@@ -599,14 +624,20 @@ branch `feat/jarvis-token-max`) rides on top of the provider system as **interna
 - `compress()` summarizes middle turns via the **auxiliary** model, preserves the system
   prompt and recent tail, prunes historical tool results before summarization, and
   **rotates the session id** through `conversation_compression.compress_context()`.
+- Summary generation must be treated as successful only when the LLM summary path
+  completes (`_last_summary_fallback_used=False`, `_last_summary_error=None`). The
+  deterministic fallback marker is a survival/degraded path, not a passing compression
+  outcome. The serialized summarizer input is bounded before calling the auxiliary LLM
+  so large tool-heavy windows do not turn compaction into a timeout-prone mega-prompt.
 - Cache-safe because earlier messages are never mutated in place — compression is the
   *one* sanctioned context rewrite. After it, providers get
   `on_session_switch(parent_session_id=...)`. Tool-call/result pairs are kept balanced
   (`_sanitize_tool_pairs`) so the API never sees an orphaned `tool_call`.
 - `TokenBudget` is separate from compression: it guards repeated large API calls **within
-  a single turn** (`per_turn_prompt_tokens`). `session_used` remains available for usage
-  dashboards/diagnostics, but `per_session_prompt_tokens` is compatibility telemetry and
-  must not produce `token_budget_exhausted:per_session`.
+  a single turn** (`per_turn_prompt_tokens`; current default 10M, expensive-model
+  default 5M). `session_used` remains available for usage dashboards/diagnostics, but
+  `per_session_prompt_tokens` is compatibility telemetry and must not produce
+  `token_budget_exhausted:per_session`.
 
 ### B. Memory  (`agent/memory_manager.py`, `memory_provider.py`, `tools/memory_tool.py`, `plugins/memory/*`)
 
@@ -754,12 +785,15 @@ history proves otherwise.
 
 - **Observed signatures:** gateway warnings like `Processing stopped after using tools
   but produced no reply`, generic `Processing completed but no response was generated`,
-  logs with `last_msg_role=tool response_len=0`, `Turn ended with pending tool result`,
+  `Processing stopped: Response truncated due to output length limit`, logs with
+  `last_msg_role=tool response_len=0`, `Turn ended with pending tool result`,
   or `token_budget_exhausted:*` after tool execution.
-- **Primary repair path:** start in `agent/conversation_loop.py` for the token-budget
-  no-tool final-answer pass, then `agent/turn_finalizer.py` for belt-and-braces
-  synthetic assistant replies, then `gateway/run.py` `_run_agent()` and
-  `_normalize_empty_agent_response()` for user-visible normalization.
+- **Primary repair path:** start in `agent/conversation_loop.py` for token-budget
+  no-tool final-answer passes and truncation classification (`final_text_truncated`
+  vs `tool_call_truncated` / `tool_call_stream_interrupted`), then
+  `agent/turn_finalizer.py` for belt-and-braces synthetic assistant replies, then
+  `gateway/run.py` `_run_agent()` and `_normalize_empty_agent_response()` for
+  user-visible normalization.
 - **Invariant:** never append a synthetic user message to escape the `tool` tail;
   preserve role alternation and prompt-cache stability. If finalization needs a nudge,
   make it API-call-scoped or append a real assistant fallback in finalization.

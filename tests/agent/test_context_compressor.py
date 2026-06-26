@@ -365,6 +365,74 @@ class TestSummaryFailureCooldown:
         assert mock_call.call_count == 1
 
 
+class TestSummaryInputBudget:
+    def test_serialize_for_summary_bounds_total_input(self):
+        """Huge compression windows must not create unbounded summarizer prompts."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        turns = []
+        for i in range(80):
+            turns.append({"role": "user", "content": f"question {i} " + ("x" * 5000)})
+            turns.append({"role": "assistant", "content": f"answer {i} " + ("y" * 5000)})
+            turns.append({"role": "tool", "tool_call_id": f"tool-{i}", "content": "z" * 5000})
+
+        serialized = c._serialize_for_summary(turns)
+        max_chars, _, _ = c._summary_input_char_budget()
+
+        assert len(serialized) <= max_chars + 5_000
+        assert "omitted to keep the compression summarizer request bounded" in serialized
+        assert "question 0" in serialized
+        assert "tool-79" in serialized
+
+    def test_summary_input_budget_scales_with_context_window(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=64_000):
+            small = ContextCompressor(model="small", quiet_mode=True)
+        with patch("agent.context_compressor.get_model_context_length", return_value=1_050_000):
+            large = ContextCompressor(model="large", quiet_mode=True)
+
+        small_budget, _, _ = small._summary_input_char_budget()
+        large_budget, _, _ = large._summary_input_char_budget()
+
+        assert small_budget < large_budget
+        assert small_budget == 32_000 * 4
+        assert large_budget == int(1_050_000 * 0.12) * 4
+
+    def test_large_compression_window_uses_llm_summary_not_fallback(self):
+        """Bounded summarizer input should let large-window compression succeed."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                threshold_percent=0.5,
+                protect_first_n=1,
+                protect_last_n=3,
+                quiet_mode=True,
+            )
+        c.threshold_tokens = 4_000
+        c.tail_token_budget = 1_000
+
+        messages = []
+        for i in range(80):
+            messages.append({"role": "user", "content": f"question {i} " + ("x" * 5000)})
+            messages.append({"role": "assistant", "content": f"answer {i} " + ("y" * 5000)})
+            messages.append({"role": "tool", "tool_call_id": f"tool-{i}", "content": "z" * 5000})
+
+        mock_ok = MagicMock()
+        mock_ok.choices = [MagicMock()]
+        mock_ok.choices[0].message.content = "successful bounded llm summary"
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_ok) as mock_call:
+            compressed = c.compress(messages, current_tokens=60_000)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        max_chars, _, _ = c._summary_input_char_budget()
+        assert len(prompt) < max_chars + 30_000
+        assert "successful bounded llm summary" in str(compressed)
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_error is None
+        assert c.compression_count == 1
+
+
 class TestSummaryFallbackToMainModel:
     """When ``summary_model`` differs from the main model and the summary LLM
     call fails, the compressor should retry once on the main model before

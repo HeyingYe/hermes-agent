@@ -901,7 +901,7 @@ DEFAULT_CONFIG = {
         # breaker.
         "token_budget": {
             "enabled": True,
-            "per_turn_prompt_tokens": 3000000,
+            "per_turn_prompt_tokens": 10000000,
             "per_session_prompt_tokens": 8000000,
             # P5.4 in-turn expensive-model (Opus) guard: while the ACTIVE model is
             # in expensive_models, the smaller of the normal cap and this tighter
@@ -915,7 +915,7 @@ DEFAULT_CONFIG = {
                 "claude-opus-4-6",
                 "claude-opus-4-5",
             ],
-            "per_turn_prompt_tokens_expensive": 1500000,
+            "per_turn_prompt_tokens_expensive": 5000000,
             "per_session_prompt_tokens_expensive": 4000000,
         },
         # Inactivity timeout for gateway agent execution (seconds).

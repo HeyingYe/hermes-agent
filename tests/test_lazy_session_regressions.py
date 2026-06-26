@@ -394,6 +394,44 @@ class TestGatewaySurfacesNullResponse:
         assert response != "", "Null response with api_calls>0 must be surfaced"
         assert "nonexistent_tool" in response
 
+    def test_partial_tool_call_truncation_gets_safe_actionable_message(self):
+        """Tool-call truncation is a safety stop: say no partial tool action ran."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 3,
+            "partial": True,
+            "interrupted": False,
+            "error_code": "tool_call_truncated",
+            "error": "Response truncated due to output length limit",
+        }
+
+        result = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "tool call" in result
+        assert "No partial tool action was executed" in result
+        assert "Try again." not in result
+
+    def test_partial_final_text_truncation_gets_recovery_message(self):
+        """Final-text truncation is recoverable and should not imply tool danger."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 3,
+            "partial": True,
+            "interrupted": False,
+            "error_code": "final_text_truncated",
+            "error": "Response remained truncated after 3 continuation attempts",
+        }
+
+        result = _normalize_empty_agent_response(agent_result, "", history_len=10)
+
+        assert "final text" in result
+        assert "no unsafe tool action was executed" in result
+        assert "Try again." not in result
+
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
         from gateway.run import _normalize_empty_agent_response
