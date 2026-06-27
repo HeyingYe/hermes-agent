@@ -163,6 +163,7 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_FEISHU_FIELD_VALIDATION_RE = re.compile(r"(?:99992402|field validation failed)", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1475,6 +1476,41 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+
+    def _plain_text_fallback_delivery_context(
+        self,
+        *,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        error: str,
+    ) -> tuple[str, Optional[str], Any]:
+        """Drop Feishu topic/reply routing when the API rejects those fields.
+
+        Feishu returns ``99992402 field validation failed`` when a reply/thread
+        field combination is invalid.  Reusing the same metadata for the
+        generic plain-text fallback repeats the same validation error, so the
+        fallback must degrade to a plain chat message instead.
+        """
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        has_thread_context = bool(
+            reply_to
+            or metadata_dict.get("thread_id")
+            or metadata_dict.get("reply_to_message_id")
+            or metadata_dict.get("create_feishu_topic")
+        )
+        if has_thread_context and _FEISHU_FIELD_VALIDATION_RE.search(error or ""):
+            logger.warning(
+                "[Feishu] Field validation failed for threaded/reply send; "
+                "plain-text fallback will drop reply/thread metadata"
+            )
+            return chat_id, None, None
+        return super()._plain_text_fallback_delivery_context(
+            chat_id=chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+            error=error,
+        )
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:

@@ -3775,6 +3775,23 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    def _plain_text_fallback_delivery_context(
+        self,
+        *,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        error: str,
+    ) -> tuple[str, Optional[str], Any]:
+        """Return delivery context for _send_with_retry's plain-text fallback.
+
+        Platform adapters may override this when a deterministic send failure
+        proves the original reply/thread metadata is invalid.  The default is
+        conservative: retry the same target and context so existing platform
+        behaviour remains unchanged.
+        """
+        return chat_id, reply_to, metadata
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -3856,11 +3873,17 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
+        fallback_chat_id, fallback_reply_to, fallback_metadata = self._plain_text_fallback_delivery_context(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
             metadata=metadata,
+            error=error_str,
+        )
+        fallback_result = await self.send(
+            chat_id=fallback_chat_id,
+            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            reply_to=fallback_reply_to,
+            metadata=fallback_metadata,
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)

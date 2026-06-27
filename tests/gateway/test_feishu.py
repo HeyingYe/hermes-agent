@@ -2121,6 +2121,58 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_with_retry_sanitizes_feishu_topic_metadata_after_field_validation_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured.append(("reply", request))
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=99992402,
+                    msg="field validation failed",
+                )
+
+            def create(self, request):
+                captured.append(("create", request))
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_plain_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter._send_with_retry(
+                    chat_id="oc_chat",
+                    content="**final answer**",
+                    metadata={
+                        "thread_id": "omt_topic",
+                        "reply_to_message_id": "om_trigger",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_plain_fallback")
+        self.assertEqual([kind for kind, _ in captured], ["reply", "create"])
+        fallback_request = captured[1][1]
+        self.assertEqual(fallback_request.receive_id_type, "chat_id")
+        self.assertFalse(hasattr(fallback_request, "message_id"))
+        self.assertEqual(fallback_request.request_body.receive_id, "oc_chat")
+        self.assertFalse(hasattr(fallback_request.request_body, "thread_id"))
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_document_reply_uses_thread_flag(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
