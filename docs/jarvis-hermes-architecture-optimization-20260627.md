@@ -100,30 +100,30 @@
 
 范围：成本/安全优化，避免误删工具。
 
-- 统计各 platform toolset 实际 schema 体积，识别高成本工具簇。
-- 明确哪些是 hard core，哪些可进入 `coding` posture、`tool_search` deferrable、plugin/MCP、profile opt-in。
-- 对 messaging/webhook 场景强化 safe toolset 和 prompt-injection 风险边界。
-- 输出 rollout：先度量、再 shadow、再 opt-in、最后考虑默认变更。
+- 已完成：新增 `scripts/tool_schema_cost_report.py`，以真实 `model_tools.get_tool_definitions(..., skip_tool_search_assembly=True)` 输出统计 model-facing schema 成本。
+- 已完成：输出 `docs/tool-schema-cost-report-20260627.md`，记录 `hermes-cli` 29 tools / 57,478 schema chars / ~14,370 tokens。
+- 已完成：补充 `coding` 与 `hermes-feishu` 真实数据：`coding` 26 tools / 46,442 chars / ~11,611 tokens；`hermes-feishu` 34 tools / 60,479 chars / ~15,120 tokens。
+- 结论：当前最大 schema 成本来自 `cronjob`、`delegate_task`、`session_search`、`terminal`、`skill_manage` 等合法核心能力，不应直接删除；下一步优先做 schema 描述压缩、渐进披露和 profile/posture shadow rollout。
+- 后续 rollout：先度量、再 shadow、再 opt-in、最后考虑默认变更。
 
 验收：
 
-- 给出真实工具列表与 schema 成本证据。
-- 给出不破坏 CLI/gateway/cron/profile 的测试矩阵。
+- 已给出真实工具列表与 schema 成本证据。
+- 已新增 `tests/test_tool_schema_cost_report.py`，覆盖成本统计、Markdown/JSON 输出和从 `scripts/` 入口导入 repo 模块。
+- 后续任何工具 schema 变更都应先跑 `python scripts/tool_schema_cost_report.py --toolsets <name>` 前后对比。
 
 ### P2：架构回归检查
 
 范围：把人工经验变成可运行守卫。
 
-- 扫描 core-touching files 中的 Jarvis/Kanban/Dashboard leakage。
-- 扫描非 secret `HERMES_*` 行为开关。
-- 扫描 HERMES_HOME 硬编码与 `~/.hermes` 旧路径。
-- 扫描 default-on 产品副作用。
-- 扫描 toolset core list 膨胀。
+- 已完成：新增 `scripts/jarvis_architecture_guard.py`，扫描 core toolset 产品工具泄漏、default-on Kanban 副作用、旧 Hermes home 硬编码、产品措辞和内部 env shim。
+- 已完成：输出 `docs/jarvis-architecture-guard-report-20260627.md`，记录当前 `errors=0 warnings=8`。
+- 当前 8 个 warning 均为已知 Kanban 兼容 env shim：`HERMES_KANBAN_DISPATCH_IN_GATEWAY` / `HERMES_KANBAN_TRACK_BACKGROUND`。它们作为 P1 migration bridge 可暂留，但不能成为用户可见配置面。
 
 验收：
 
-- 以 pytest 或 doctor 子检查形式运行。
-- 误报有 allowlist 和原因说明。
+- 已以 pytest 覆盖：`tests/test_jarvis_architecture_guard.py`。
+- 已有误报处理规则：默认只对 error 非零退出；warnings 作为 migration backlog，`--strict-warnings` 可在后续迁移完成后启用。
 
 ## 4. 已确认的 Kanban 执行项
 
