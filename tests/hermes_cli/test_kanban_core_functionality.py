@@ -3379,6 +3379,20 @@ def test_config_background_tracking_defaults_off():
     assert kanban.get("track_background_processes") is False
 
 
+def test_config_auto_subscribe_default_has_single_runtime_source():
+    """Kanban auto-subscribe should exist in the final runtime DEFAULT_CONFIG.
+
+    A duplicate ``kanban`` dict in DEFAULT_CONFIG used to define this key in an
+    earlier literal block and then overwrite it with the dispatcher settings
+    block, leaving tools/kanban_tools.py to rely on an implicit cfg_get fallback.
+    Keep the runtime default explicit so config docs, saved config templates,
+    and tool fallback semantics do not drift.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG
+    kanban = DEFAULT_CONFIG.get("kanban", {})
+    assert kanban.get("auto_subscribe_on_create") is True
+
+
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
     from hermes_cli import kanban as kb_cli
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)

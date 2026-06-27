@@ -229,6 +229,31 @@ class TestToolsetConsistency:
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
 
+    def test_hermes_platform_core_excludes_kanban_product_tools(self):
+        """Generic Hermes platform toolsets must not expose product-layer Kanban tools.
+
+        Kanban remains available through the explicit ``kanban`` toolset and
+        dispatcher-spawned worker env, but it should not live in the shared
+        model-facing core schema that every normal CLI/gateway session pays for.
+        """
+        kanban_tools = set(resolve_toolset("kanban"))
+        assert kanban_tools, "sanity: explicit kanban toolset should still exist"
+
+        platform_toolsets = [
+            "hermes-cli",
+            "hermes-cron",
+            "hermes-telegram",
+            "hermes-discord",
+            "hermes-whatsapp",
+            "hermes-slack",
+            "hermes-signal",
+            "hermes-homeassistant",
+            "hermes-feishu",
+        ]
+        for name in platform_toolsets:
+            leaked = kanban_tools & set(resolve_toolset(name))
+            assert not leaked, f"{name} leaked product-layer Kanban tools: {sorted(leaked)}"
+
 
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):

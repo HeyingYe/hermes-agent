@@ -14,6 +14,21 @@ import os
 import pytest
 
 
+def _model_tool_names(monkeypatch, enabled_toolsets):
+    """Resolve model-facing tool names through the public schema provider."""
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    schema = get_tool_definitions(
+        enabled_toolsets=list(enabled_toolsets),
+        quiet_mode=True,
+    )
+    return {s["function"].get("name") for s in schema if "function" in s}
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -26,13 +41,7 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # ensure registered
-    from tools.registry import invalidate_check_fn_cache, registry
-    from toolsets import resolve_toolset
-
-    invalidate_check_fn_cache()
-    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
-    names = {s["function"].get("name") for s in schema if "function" in s}
+    names = _model_tool_names(monkeypatch, ["hermes-cli"])
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert kanban == set(), (
         f"kanban tools leaked into normal chat schema: {kanban}"
@@ -46,13 +55,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # ensure registered
-    from tools.registry import invalidate_check_fn_cache, registry
-    from toolsets import resolve_toolset
-
-    invalidate_check_fn_cache()
-    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
-    names = {s["function"].get("name") for s in schema if "function" in s}
+    names = _model_tool_names(monkeypatch, ["hermes-cli"])
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
@@ -70,17 +73,7 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # ensure registered
-    from model_tools import _clear_tool_defs_cache, get_tool_definitions
-    from tools.registry import invalidate_check_fn_cache
-
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-    schema = get_tool_definitions(
-        enabled_toolsets=["terminal"],
-        quiet_mode=True,
-    )
-    names = {s["function"].get("name") for s in schema if "function" in s}
+    names = _model_tool_names(monkeypatch, ["terminal"])
     assert "kanban_show" in names
     assert "kanban_complete" in names
     assert "kanban_block" in names
@@ -100,13 +93,7 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # ensure registered
-    from tools.registry import invalidate_check_fn_cache, registry
-    from toolsets import resolve_toolset
-
-    invalidate_check_fn_cache()
-    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
-    names = {s["function"].get("name") for s in schema if "function" in s}
+    names = _model_tool_names(monkeypatch, ["hermes-cli", "kanban"])
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert {
         "kanban_list",
@@ -125,13 +112,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    import tools.kanban_tools  # ensure registered
-    from tools.registry import invalidate_check_fn_cache, registry
-    from toolsets import resolve_toolset
-
-    invalidate_check_fn_cache()
-    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
-    names = {s["function"].get("name") for s in schema if "function" in s}
+    names = _model_tool_names(monkeypatch, ["kanban"])
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",

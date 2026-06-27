@@ -707,9 +707,10 @@ class GatewayKanbanWatchersService:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
+        # Single-dispatcher backstop. dispatch_in_gateway must be an explicit
+        # opt-in; this advisory lock is still the safety net for misconfigured
+        # Jarvis/Kanban profiles or same-profile restart races that might
+        # otherwise start a second dispatcher. Concurrent dispatchers double
         # frequency, double claim-attempt events, and — with
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root
