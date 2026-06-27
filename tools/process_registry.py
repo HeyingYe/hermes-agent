@@ -170,7 +170,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
-    kanban_task_id: str = ""                    # Kanban card id when the background-process→board bridge is on
+    kanban_task_id: str = ""                    # Board card id when the background-process→board bridge is on
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""

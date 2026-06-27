@@ -6905,8 +6905,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewaySlashCommandsMixin):
             return "default"
 
     # ── Optional gateway background services ────────────────────────────
-    # Product-layer watchers such as Kanban register through
-    # gateway.background_services only when their config gates opt in.
+    # Product-layer watchers register through gateway.background_services
+    # only when their config gates opt in.
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.

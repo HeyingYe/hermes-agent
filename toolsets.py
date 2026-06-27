@@ -66,7 +66,7 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Kanban multi-agent coordination is intentionally NOT in the shared core
+    # Multi-agent board coordination is intentionally NOT in the shared core
     # platform list. Dispatcher-spawned workers get the explicit ``kanban``
     # toolset appended by model_tools when HERMES_KANBAN_TASK is set, and
     # orchestrator profiles can opt in via their config toolsets. Keeping it
@@ -255,7 +255,7 @@ TOOLSETS = {
 
     "kanban": {
         "description": (
-            "Kanban multi-agent coordination — only active when the agent "
+            "Multi-agent board coordination — only active when the agent "
             "is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env "
             "set). The dispatcher runs inside the gateway by default; see "
             "`kanban.dispatch_in_gateway` in config.yaml. Lets workers mark "

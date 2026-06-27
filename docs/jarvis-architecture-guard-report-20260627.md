@@ -22,20 +22,19 @@ python scripts/jarvis_architecture_guard.py --root . --format text
 Observed result after the latest guard expansion:
 
 ```text
-Jarvis architecture guard: errors=0 warnings=24
+Jarvis architecture guard: errors=0 warnings=8
 ```
 
 Warnings by code:
 
-- `product-term-in-engine-file`: 16
 - `internal-env-compat-shim`: 8
 
 Interpretation:
 
 - There are no blocking architecture errors in the current branch.
-- The 24 warnings are migration signals, not release blockers in non-strict mode.
-- `product-term-in-engine-file` warnings come from the expanded product-term scanner for `Jarvis`, `Kanban`, or `Dashboard` in engine-owned files. They identify future P1/P2 cleanup targets and should not be treated as blockers while compatibility bridges remain.
-- `internal-env-compat-shim` warnings are the known Kanban compatibility env shims:
+- The remaining 8 warnings are migration signals, not release blockers in non-strict mode.
+- Product-term warnings from engine-owned files were cleaned up with comment/description-only wording changes; runtime behavior and defaults were not changed.
+- `internal-env-compat-shim` warnings are the known compatibility env shims:
   - `HERMES_KANBAN_DISPATCH_IN_GATEWAY`
   - `HERMES_KANBAN_TRACK_BACKGROUND`
 - The high-signal non-secret `HERMES_*` scanner is enabled but currently produces no warnings in this checkout; it only targets explicit user-facing `set/export HERMES_...=` instructions outside skipped app/plugin/docker/website/skill trees.

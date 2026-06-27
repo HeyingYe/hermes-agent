@@ -1481,8 +1481,8 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
-        # Triage specifier — flesh out a rough one-liner in the Kanban
-        # Triage column into a concrete spec, then promote it to ``todo``.
+        # Board triage specifier — flesh out a rough one-liner in the triage
+        # column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
         # cheap, capable model here (gemini-flash works well); the main
         # model is overkill for short spec expansion.
@@ -1494,7 +1494,7 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
         },
-        # Kanban decomposer — decomposes a triage task into a graph of
+        # Board decomposer — decomposes a triage task into a graph of
         # child tasks routed to specialist profiles by description.
         # Invoked by ``hermes kanban decompose`` and the kanban
         # auto-decompose dispatcher tick. Returns a JSON task graph;
@@ -1767,7 +1767,7 @@ DEFAULT_CONFIG = {
 
     # Web dashboard settings
     "dashboard": {
-        "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        "theme": "default",  # Web UI visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent
@@ -2465,7 +2465,7 @@ DEFAULT_CONFIG = {
         "output_retention": 50,
     },
 
-    # Kanban multi-agent coordination — controls the dispatcher loop that
+    # Multi-agent board coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
     # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
@@ -2481,8 +2481,8 @@ DEFAULT_CONFIG = {
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
         # Run the dispatcher inside the gateway process. Off by default so
-        # a generic Hermes gateway has no Kanban DB polling or worker-spawn
-        # side effects. Jarvis/Kanban deployments should enable this
+        # a generic Hermes gateway has no board DB polling or worker-spawn
+        # side effects. Product board deployments should enable this
         # explicitly in their profile or distribution overlay.
         "dispatch_in_gateway": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
@@ -2517,9 +2517,9 @@ DEFAULT_CONFIG = {
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
         # Mirror terminal(background=true) / PTY / env-backed background
-        # processes onto the Kanban board as visibility-only cards. Off by
+        # processes onto the board as visibility-only cards. Off by
         # default so normal Hermes background work has no product-layer board
-        # side effects; Jarvis/Kanban profiles can opt in globally in config
+        # side effects; product board profiles can opt in globally in config
         # or per-process with HERMES_KANBAN_TRACK_BACKGROUND=1.
         "track_background_processes": False,
         # When true, the kanban dispatcher auto-runs the decomposer on
@@ -5842,7 +5842,7 @@ def write_platform_config_field(
     """Persist one scalar field under ``platforms.<platform_key>``.
 
     ``raw=True`` preserves CLI setup flows that intentionally edit only the
-    user's raw config file. Dashboard routes use the default loaded-config path
+    user's raw config file. Web UI routes use the default loaded-config path
     so they retain their existing profile-scoped ``load_config`` behavior.
     """
     config = read_raw_config() if raw else load_config()

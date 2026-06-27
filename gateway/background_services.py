@@ -56,7 +56,7 @@ def clear_gateway_background_services_for_tests() -> None:
 
 
 def _kanban_gateway_services_enabled() -> bool:
-    """Return whether built-in Kanban gateway services should be imported."""
+    """Return whether built-in board gateway services should be imported."""
 
     import os
 
