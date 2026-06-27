@@ -2,6 +2,8 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+For runtime architecture and ownership boundaries, read `SELF_ARCHITECTURE.md` first. It is the repo-local architecture map that complements this development guide and should be updated in the same change when architecture/defaults/extension seams change.
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
