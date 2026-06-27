@@ -1688,6 +1688,7 @@ def run_conversation(
                             "completed": False,
                             "partial": True,
                             "error": _exhaust_error,
+                            "error_code": "thinking_budget_exhausted",
                         }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -1749,6 +1750,7 @@ def run_conversation(
                                 "completed": False,
                                 "partial": True,
                                 "error": "Response remained truncated after 3 continuation attempts",
+                                "error_code": "final_text_truncated",
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -1814,6 +1816,11 @@ def run_conversation(
                                     if _is_stub_stall
                                     else "Response truncated due to output length limit"
                                 ),
+                                "error_code": (
+                                    "tool_call_stream_interrupted"
+                                    if _is_stub_stall
+                                    else "tool_call_truncated"
+                                ),
                             }
 
                     # If we have prior messages, roll back to last complete state
@@ -1830,7 +1837,8 @@ def run_conversation(
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": "Response truncated due to output length limit"
+                            "error": "Response truncated due to output length limit",
+                            "error_code": "response_truncated",
                         }
                     else:
                         # First message was truncated - mark as failed
@@ -1843,7 +1851,8 @@ def run_conversation(
                             "api_calls": api_call_count,
                             "completed": False,
                             "failed": True,
-                            "error": "First response truncated due to output length limit"
+                            "error": "First response truncated due to output length limit",
+                            "error_code": "first_response_truncated",
                         }
                 
                 # Track actual token usage from response for context management
@@ -4092,6 +4101,7 @@ def run_conversation(
                             "completed": False,
                             "partial": True,
                             "error": "Response truncated due to output length limit",
+                            "error_code": "tool_call_truncated",
                         }
 
                     # Track retries for invalid JSON arguments

@@ -2056,11 +2056,23 @@ class APIServerAdapter(BasePlatformAdapter):
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
         err_msg = result.get("error")
+        result_error_code = result.get("error_code")
 
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
-        if is_partial and err_msg and "truncat" in err_msg.lower():
+        truncation_error_codes = {
+            "final_text_truncated",
+            "first_response_truncated",
+            "response_truncated",
+            "tool_call_truncated",
+            "tool_call_stream_interrupted",
+            "output_truncated",
+        }
+        if is_partial and (
+            (err_msg and "truncat" in str(err_msg).lower())
+            or result_error_code in truncation_error_codes
+        ):
             finish_reason = "length"
         elif is_failed or (not completed and err_msg):
             finish_reason = "error"
@@ -2086,6 +2098,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "completed": completed,
                 "partial": is_partial,
                 "failed": is_failed,
+                "error_code": result_error_code or (
+                    "output_truncated" if finish_reason == "length" else "agent_error"
+                ),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
@@ -2121,7 +2136,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                "error_code": result_error_code or (
+                    "output_truncated" if finish_reason == "length" else "agent_error"
+                ),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"

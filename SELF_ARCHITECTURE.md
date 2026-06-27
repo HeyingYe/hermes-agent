@@ -211,7 +211,16 @@ Rules:
 - Procedures belong in skills, not memory.
 - If a skill is outdated or wrong, patch it during the task that discovers the problem.
 
-## 11. Diagnostics before guessing
+## 11. Output-length and partial-response layering
+
+When a turn stops with `partial=True` or an output-length warning, classify the layer before changing caps or blaming a platform adapter:
+
+- Agent loop (`agent/conversation_loop.py`) owns provider/model `finish_reason=length`, continuation attempts, unsafe truncated tool-call detection, and structured `error_code` values such as `final_text_truncated`, `tool_call_truncated`, `tool_call_stream_interrupted`, and `thinking_budget_exhausted`.
+- Gateway normalization (`gateway/run.py::_normalize_empty_agent_response`) turns structured partial results into user-facing recovery guidance. Tool-call truncation must say no partial tool action was executed; final-text truncation should suggest concise continuation or file/artifact-backed delivery.
+- API surfaces (`gateway/platforms/api_server.py`) must preserve `error_code` in Hermes extras so clients can distinguish recoverable final-text truncation from unsafe tool-call truncation.
+- Platform adapters own delivery-size splitting/chunking after a final response exists. Do not classify `Response truncated due to output length limit` as a Feishu/Slack/Telegram send failure unless platform send logs prove delivery failed.
+
+## 12. Diagnostics before guessing
 
 Useful commands:
 
@@ -229,7 +238,7 @@ python -m py_compile <changed-python-files>
 
 For code changes, capture real verification output before reporting done.
 
-## 12. Core-touching checklist
+## 13. Core-touching checklist
 
 Before touching these areas, classify the change and document why a plugin/sidecar/profile/cron/skill/script/MCP approach is not enough:
 
@@ -247,7 +256,7 @@ Before touching these areas, classify the change and document why a plugin/sidec
 
 For any such change, add behavior-contract tests and verify real execution.
 
-## 13. Updating this file
+## 14. Updating this file
 
 Update `SELF_ARCHITECTURE.md` when:
 

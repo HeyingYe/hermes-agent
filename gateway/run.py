@@ -2404,6 +2404,32 @@ def _normalize_empty_agent_response(
     if api_calls > 0 and not agent_result.get("interrupted"):
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
+            error_code = str(agent_result.get("error_code") or "")
+            if error_code == "tool_call_truncated":
+                return (
+                    "⚠️ Processing stopped: the model response was cut off while "
+                    "writing a tool call; the partial tool action was not executed. "
+                    "Send `continue` to retry with a shorter or more specific request."
+                )
+            if error_code == "tool_call_stream_interrupted":
+                return (
+                    "⚠️ Processing stopped: the stream dropped mid tool call; "
+                    "Hermes did not execute the partial tool action. Send "
+                    "`continue` to retry."
+                )
+            if error_code == "final_text_truncated":
+                return (
+                    "⚠️ Processing stopped: the final answer repeatedly hit the "
+                    "model output length limit after continuation attempts. Send "
+                    "`continue` and ask for a concise summary, or ask Hermes to "
+                    "write the long result to a file/artifact and return the path."
+                )
+            if error_code == "thinking_budget_exhausted":
+                return (
+                    "⚠️ Processing stopped: the model used its output budget on "
+                    "reasoning and did not leave enough room for the answer. Lower "
+                    "reasoning effort or switch to a larger/non-reasoning model."
+                )
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
         return (
             "⚠️ Processing completed but no response was generated. "

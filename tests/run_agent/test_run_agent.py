@@ -4570,6 +4570,8 @@ class TestRunConversation:
         # (up to 3), not immediately fire thinking-exhaustion.
         assert result["api_calls"] == 3
         assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error_code"] == "final_text_truncated"
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
@@ -4592,6 +4594,7 @@ class TestRunConversation:
         assert result["completed"] is False
         assert result["partial"] is True
         assert "truncated due to output length limit" in result["error"]
+        assert result["error_code"] == "tool_call_truncated"
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_call_retries_once_before_refusing(self, agent):
