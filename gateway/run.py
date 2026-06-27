@@ -1730,7 +1730,6 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -2536,7 +2535,7 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -3322,6 +3321,126 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug(
                 "telegram topic binding refresh failed (%s)", reason, exc_info=True,
             )
+
+    # ── Feishu "topic = session" lanes ────────────────────────────────────
+    # Feishu DMs mirror the Telegram topic-lane model: each 话题 (topic,
+    # thread_id ``omt_…``) is an independent Hermes session. The difference is
+    # that the *bot* opens the topic (via a threaded first reply) rather than
+    # the user, so binding happens after that reply returns the new thread_id.
+
+    _FEISHU_TOPIC_KICKOFF_TEXT = "🧵 已开启独立任务会话，后续请在本话题内继续跟进。"
+
+    def _feishu_topic_sessions_enabled(self) -> bool:
+        """Return whether Feishu 'topic = session' mode is on (default True)."""
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return True
+        try:
+            if isinstance(cfg, dict):
+                val = cfg.get("feishu_topic_sessions")
+                if val is None and isinstance(cfg.get("feishu"), dict):
+                    val = cfg["feishu"].get("topic_sessions")
+            else:
+                val = getattr(cfg, "feishu_topic_sessions", None)
+        except Exception:
+            return True
+        return True if val is None else bool(val)
+
+    def _is_feishu_topic_lane(self, source: SessionSource) -> bool:
+        """True for a Feishu private-chat message inside a 话题 (omt_ thread)."""
+        if source.platform != Platform.FEISHU or source.chat_type != "dm":
+            return False
+        if not self._feishu_topic_sessions_enabled():
+            return False
+        return str(source.thread_id or "").startswith("omt_")
+
+    def _is_feishu_topic_top_level(self, source: SessionSource) -> bool:
+        """True for a top-level Feishu DM (no topic) that should start a new session."""
+        if source.platform != Platform.FEISHU or source.chat_type != "dm":
+            return False
+        if not self._feishu_topic_sessions_enabled():
+            return False
+        return not str(source.thread_id or "")
+
+    def _record_feishu_topic_binding(self, source: SessionSource, session_entry) -> None:
+        """Persist the Feishu topic -> Hermes session binding."""
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None or not source.chat_id or not source.thread_id:
+            return
+        session_db.bind_feishu_topic(
+            chat_id=str(source.chat_id),
+            thread_id=str(source.thread_id),
+            user_id=str(source.user_id or ""),
+            session_key=session_entry.session_key,
+            session_id=session_entry.session_id,
+        )
+
+    def _sync_feishu_topic_binding(self, source: SessionSource, session_entry, *, reason: str) -> None:
+        """Update the Feishu topic binding to point at ``session_entry.session_id``."""
+        if not self._is_feishu_topic_lane(source):
+            return
+        try:
+            self._record_feishu_topic_binding(source, session_entry)
+        except Exception:
+            logger.debug(
+                "feishu topic binding refresh failed (%s)", reason, exc_info=True,
+            )
+
+    async def _open_feishu_topic_for_session(self, source, event, session_entry):
+        """Open a Feishu 话题 for a brand-new top-level DM session and bind it.
+
+        Sends a threaded reply to the inbound message — Feishu mints a new
+        ``omt_…`` thread for it — captures that thread_id, binds it to the
+        session, and rewrites ``source``/``event.source`` so the rest of the
+        turn replies inside the topic. On any failure the source is returned
+        unchanged and the session simply stays a top-level reply (graceful
+        degradation).
+        """
+        adapter = self.adapters.get(source.platform)
+        msg_id = getattr(event, "message_id", None)
+        if adapter is None or not msg_id or not source.chat_id:
+            return source
+        try:
+            result = await adapter.send(
+                str(source.chat_id),
+                self._FEISHU_TOPIC_KICKOFF_TEXT,
+                metadata={
+                    "create_feishu_topic": True,
+                    "reply_to_message_id": str(msg_id),
+                },
+            )
+        except Exception:
+            logger.debug("feishu topic kickoff send failed", exc_info=True)
+            return source
+        omt = getattr(result, "thread_id", None) if result else None
+        if not omt:
+            logger.info(
+                "feishu topic kickoff returned no thread_id (chat=%s msg=%s); staying top-level",
+                source.chat_id, msg_id,
+            )
+            return source
+        new_source = dataclasses.replace(source, thread_id=str(omt))
+        try:
+            if self._session_db is not None:
+                self._session_db.bind_feishu_topic(
+                    chat_id=str(new_source.chat_id),
+                    thread_id=str(omt),
+                    user_id=str(new_source.user_id or ""),
+                    session_key=session_entry.session_key,
+                    session_id=session_entry.session_id,
+                )
+        except Exception:
+            logger.debug("feishu topic binding failed", exc_info=True)
+        try:
+            event.source = new_source
+        except Exception:
+            pass
+        self._cache_session_source(session_entry.session_key, new_source)
+        logger.info(
+            "feishu topic opened: chat=%s root_msg=%s thread=%s session=%s",
+            new_source.chat_id, msg_id, omt, session_entry.session_id,
+        )
+        return new_source
 
     def _recover_telegram_topic_thread_id(
         self,
@@ -5961,6 +6080,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Discover and load event hooks
         self.hooks.discover_and_load()
 
+        # Register optional gateway background services. Feature modules own their
+        # config gates, so generic gateway startup does not import or start
+        # product-layer watchers unless explicitly enabled.
+        try:
+            from gateway.background_services import register_optional_gateway_background_services
+            register_optional_gateway_background_services()
+        except Exception:
+            logger.warning("optional gateway service registration failed", exc_info=True)
+
         
         # Recover background processes from checkpoint (crash recovery)
         try:
@@ -6309,16 +6437,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
-        asyncio.create_task(self._kanban_notifier_watcher())
-
-        # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
-        asyncio.create_task(self._kanban_dispatcher_watcher())
+        # Start optional background services registered by feature/plugin-style
+        # modules. Generic gateway services stay above; product-layer services
+        # are registered only after their own config gates opt in.
+        try:
+            from gateway.background_services import start_gateway_background_services
+            start_gateway_background_services(self)
+        except Exception:
+            logger.warning("optional gateway background services failed to start", exc_info=True)
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -6778,11 +6904,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
-    # ── Kanban board watchers ───────────────────────────────────────────
-    # The kanban notifier/dispatcher watcher loops + their helpers live in
-    # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
-    # self state, so inheriting the mixin keeps every self._kanban_* call site
-    # working unchanged while lifting ~1,000 LOC out of this file.
+    # ── Optional gateway background services ────────────────────────────
+    # Product-layer watchers such as Kanban register through
+    # gateway.background_services only when their config gates opt in.
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
@@ -9428,7 +9552,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = self.session_store.get_or_create_session(source)
+        # Feishu "topic = session": a top-level DM (no omt_ thread) starts a
+        # brand-new session every time — the user dispatches concurrent tasks —
+        # then the bot opens a 话题 for it. In-topic messages resume the bound
+        # session (handled in the elif below). force_new makes each top-level
+        # DM its own session instead of reusing the rolling per-chat session.
+        _feishu_top_level = self._is_feishu_topic_top_level(source)
+        session_entry = self.session_store.get_or_create_session(
+            source, force_new=_feishu_top_level,
+        )
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
@@ -9487,6 +9619,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._record_telegram_topic_binding(source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        elif self._is_feishu_topic_lane(source):
+            # In-topic Feishu message: resolve the topic→session binding and
+            # switch to it so follow-ups continue the same task session.
+            try:
+                binding = self._session_db.get_feishu_topic_binding(
+                    chat_id=str(source.chat_id),
+                    thread_id=str(source.thread_id),
+                ) if self._session_db else None
+            except Exception:
+                logger.debug("Failed to read Feishu topic binding", exc_info=True)
+                binding = None
+            if binding:
+                bound_session_id = str(binding.get("session_id") or "")
+                # Heal a binding that points at a pre-compression parent by
+                # walking the compression-continuation chain to its tip (mirrors
+                # the Telegram path above). Cheap no-op when not a parent.
+                if bound_session_id and self._session_db is not None:
+                    try:
+                        canonical_session_id = self._session_db.get_compression_tip(
+                            bound_session_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "compression-tip lookup failed for %s",
+                            bound_session_id, exc_info=True,
+                        )
+                        canonical_session_id = bound_session_id
+                    if canonical_session_id and canonical_session_id != bound_session_id:
+                        bound_session_id = canonical_session_id
+                if bound_session_id and bound_session_id != session_entry.session_id:
+                    switched = self.session_store.switch_session(session_key, bound_session_id)
+                    if switched is not None:
+                        session_entry = switched
+                if (
+                    bound_session_id
+                    and bound_session_id != str(binding.get("session_id") or "")
+                ):
+                    self._sync_feishu_topic_binding(
+                        source, session_entry, reason="compression-tip-walk",
+                    )
+            else:
+                # A topic with no binding (e.g. one the user created by hand):
+                # treat it as its own session and record the binding.
+                try:
+                    self._record_feishu_topic_binding(source, session_entry)
+                except Exception:
+                    logger.debug("Failed to record Feishu topic binding", exc_info=True)
+        elif _feishu_top_level:
+            # Brand-new top-level Feishu DM: open a dedicated 话题 and bind it so
+            # this task gets its own session and follow-ups land in the topic.
+            source = await self._open_feishu_topic_for_session(source, event, session_entry)
+            session_key = session_entry.session_key
+
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).

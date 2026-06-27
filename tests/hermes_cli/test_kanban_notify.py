@@ -1,3 +1,4 @@
+from gateway.kanban_watchers import _RunnerBackedKanbanWatchers
 import asyncio
 import pytest
 
@@ -22,6 +23,7 @@ def kanban_home(tmp_path, monkeypatch):
     # test silently drops files because ``tmp_path`` isn't inside the
     # default ``MEDIA_DELIVERY_SAFE_ROOTS`` cache dirs.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "true")
     kb.init_db()
     return home
 
@@ -60,9 +62,9 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -120,9 +122,9 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -191,9 +193,9 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     finally:
         conn.close()
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -212,9 +214,9 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     finally:
         conn.close()
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -278,10 +280,10 @@ async def test_notifier_does_not_call_init_db(kanban_home):
         init_db_calls.append((args, kwargs))
         return real_init_db(*args, **kwargs)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep), \
          patch("hermes_cli.kanban_db.init_db", side_effect=_spy_init_db):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -316,14 +318,14 @@ def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
     # `_kanban_dispatcher_watcher`. Read the source and assert the
     # specific patterns that would reintroduce the bug are absent.
     import inspect
-    src = inspect.getsource(GatewayRunner._kanban_dispatcher_watcher)
+    src = inspect.getsource(_RunnerBackedKanbanWatchers._kanban_dispatcher_watcher)
     assert "_kb.init_db(board=slug)" not in src, (
         "_kanban_dispatcher_watcher must not call _kb.init_db(board=slug) — "
         "see issue #21378. Use connect() alone; it runs migrations on first "
         "open per process."
     )
 
-    notifier_src = inspect.getsource(GatewayRunner._kanban_notifier_watcher)
+    notifier_src = inspect.getsource(_RunnerBackedKanbanWatchers._kanban_notifier_watcher)
     assert "_kb.init_db(board=slug)" not in notifier_src, (
         "_kanban_notifier_watcher must not call _kb.init_db(board=slug) — "
         "see issue #21378."
@@ -370,9 +372,9 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
         if tick_count >= 3:
             runner._running = False
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -425,9 +427,9 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -572,9 +574,9 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 
@@ -648,9 +650,9 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     async def _fast_sleep(_):
         await _orig_sleep(0)
 
-    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
         await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
+            _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1),
             timeout=10.0,
         )
 

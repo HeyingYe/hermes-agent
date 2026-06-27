@@ -44,7 +44,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -86,93 +86,67 @@ def format_uptime_short(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
-def _kanban_bridge_enabled() -> bool:
-    """Whether spawned background processes should mirror onto the Kanban board.
+@dataclass(frozen=True)
+class BackgroundProcessEvent:
+    """Event emitted when a managed background process changes lifecycle state."""
 
-    Defaults to the config value ``kanban.track_background_processes``.
-    Dashboard-centric deployments want every concurrent/background task to
-    appear on the board, while other users can still disable this globally or
-    per-process by setting ``HERMES_KANBAN_TRACK_BACKGROUND=0``.
-    """
+    kind: Literal["started", "finished"]
+    session: "ProcessSession"
+
+
+BackgroundProcessSubscriber = Callable[[BackgroundProcessEvent], None]
+_BACKGROUND_PROCESS_SUBSCRIBERS: list[BackgroundProcessSubscriber] = []
+
+
+def register_background_process_subscriber(subscriber: BackgroundProcessSubscriber) -> None:
+    """Register a best-effort lifecycle subscriber for managed background processes."""
+    if subscriber not in _BACKGROUND_PROCESS_SUBSCRIBERS:
+        _BACKGROUND_PROCESS_SUBSCRIBERS.append(subscriber)
+
+
+def unregister_background_process_subscriber(subscriber: BackgroundProcessSubscriber) -> None:
+    """Unregister a background-process lifecycle subscriber if present."""
+    try:
+        _BACKGROUND_PROCESS_SUBSCRIBERS.remove(subscriber)
+    except ValueError:
+        pass
+
+
+def _emit_background_process_event(kind: Literal["started", "finished"], session: "ProcessSession") -> None:
+    """Emit a best-effort lifecycle event without blocking process management."""
+    event = BackgroundProcessEvent(kind=kind, session=session)
+    for subscriber in list(_BACKGROUND_PROCESS_SUBSCRIBERS):
+        try:
+            subscriber(event)
+        except Exception:
+            logger.debug("background process subscriber failed for %s", kind, exc_info=True)
+
+
+def _maybe_register_optional_background_process_subscribers() -> None:
+    """Register optional product-layer subscribers only when explicitly enabled."""
     env = os.environ.get("HERMES_KANBAN_TRACK_BACKGROUND")
-    if env is not None:
-        return env.strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        return bool(kcfg.get("track_background_processes", True))
-    except Exception:
-        return True
+    env_enabled = env is not None and env.strip().lower() in {"1", "true", "yes", "on"}
+    config_enabled = False
+    if env is None:
+        try:
+            from hermes_cli.config import load_config
 
-
-def _kanban_bridge_create(session: "ProcessSession") -> None:
-    """Best-effort: create a 'running' Kanban card mirroring this background task.
-
-    The card carries no claim/run and is never picked up by the dispatcher
-    (``release_stale_claims`` only touches tasks with ``claim_expires`` set, and
-    the dispatcher only spawns 'ready' tasks), so it is a pure visibility row
-    that lands on the Jarvis Dashboard. Never raises — a board/DB hiccup must
-    not break process spawning.
-    """
-    if not _kanban_bridge_enabled():
+            cfg = load_config()
+            kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            config_enabled = bool(kcfg.get("track_background_processes", False))
+        except Exception:
+            config_enabled = False
+    if not (env_enabled or config_enabled):
         return
     try:
-        from hermes_cli import kanban_db as kb
-        first_line = (session.command or "").strip().splitlines()[0] if session.command.strip() else ""
-        title = ("[bg] " + (first_line[:116] or "background process"))
-        assignee = os.environ.get("HERMES_PROFILE") or "background"
-        with kb.connect_closing() as conn:
-            tid = kb.create_task(
-                conn,
-                title=title,
-                body=session.command,
-                assignee=assignee,
-                created_by=assignee,
-                workspace_kind="scratch",
-                initial_status="running",
-                session_id=session.session_key or None,
-                # Idempotent on the process session id so a checkpoint-recovery
-                # or duplicate spawn call can't create a second card.
-                idempotency_key=f"bgproc:{session.id}",
-            )
-            # Visibility-only cards should appear as running immediately.
-            # create_task() intentionally recomputes non-blocked statuses as
-            # ready/todo for normal dispatcher work, so do a narrow post-create
-            # transition here instead of widening create_task's public status
-            # semantics.
-            with kb.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET status = 'running', last_heartbeat_at = ? WHERE id = ?",
-                    (int(time.time()), tid),
-                )
-        session.kanban_task_id = tid
-        # A very short-lived background process can exit between spawn and the
-        # bridge card creation path (reader/poller thread wins the race). In
-        # that case _move_to_finished() has already run with no kanban_task_id
-        # to close, so close the visibility card immediately after linking it.
-        if session.exited:
-            _kanban_bridge_finish(session)
+        from tools.kanban_background_bridge import kanban_background_process_subscriber
     except Exception:
-        logger.debug("kanban bridge: create card failed", exc_info=True)
-
-
-def _kanban_bridge_finish(session: "ProcessSession") -> None:
-    """Best-effort: close the mirrored Kanban card when the process exits."""
-    tid = getattr(session, "kanban_task_id", "")
-    if not tid:
+        logger.debug("kanban background bridge subscriber unavailable", exc_info=True)
         return
-    try:
-        from hermes_cli import kanban_db as kb
-        code = session.exit_code
-        if code in (0, None):
-            summary = f"Background process {session.id} exited (code {code})."
-        else:
-            summary = f"Background process {session.id} exited non-zero (code {code})."
-        with kb.connect_closing() as conn:
-            kb.complete_task(conn, tid, summary=summary, result=f"exit_code={code}")
-    except Exception:
-        logger.debug("kanban bridge: complete card failed", exc_info=True)
+    register_background_process_subscriber(kanban_background_process_subscriber)
+
+
+_maybe_register_optional_background_process_subscribers()
 
 
 @dataclass
@@ -811,7 +785,7 @@ class ProcessRegistry:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
-                _kanban_bridge_create(session)
+                _emit_background_process_event("started", session)
                 self._write_checkpoint()
                 return session
 
@@ -864,7 +838,7 @@ class ProcessRegistry:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
-            _kanban_bridge_create(session)
+            _emit_background_process_event("started", session)
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
@@ -985,7 +959,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
         if not session.exited:
-            _kanban_bridge_create(session)
+            _emit_background_process_event("started", session)
             self._write_checkpoint()
 
         return session
@@ -1124,7 +1098,7 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         if was_running:
-            _kanban_bridge_finish(session)
+            _emit_background_process_event("finished", session)
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without

@@ -2487,12 +2487,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
-        # Run the dispatcher inside the gateway process. On by default —
-        # the cost is ~300µs every `dispatch_interval_seconds` when idle,
-        # and gateway is the supervisor users already have. Set to false
-        # only if you run the dispatcher as a separate systemd unit or
-        # don't want the gateway to spawn workers.
-        "dispatch_in_gateway": True,
+        # Run the dispatcher inside the gateway process. Off by default so
+        # a generic Hermes gateway has no Kanban DB polling or worker-spawn
+        # side effects. Jarvis/Kanban deployments should enable this
+        # explicitly in their profile or distribution overlay.
+        "dispatch_in_gateway": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -2525,12 +2524,11 @@ DEFAULT_CONFIG = {
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
         # Mirror terminal(background=true) / PTY / env-backed background
-        # processes onto the Kanban board as visibility-only cards. This is
-        # what makes ad-hoc concurrent work show up in Jarvis Dashboard even
-        # when it was not originally spawned by the Kanban dispatcher. Operators
-        # can disable globally in config or per-process with
-        # HERMES_KANBAN_TRACK_BACKGROUND=0.
-        "track_background_processes": True,
+        # processes onto the Kanban board as visibility-only cards. Off by
+        # default so normal Hermes background work has no product-layer board
+        # side effects; Jarvis/Kanban profiles can opt in globally in config
+        # or per-process with HERMES_KANBAN_TRACK_BACKGROUND=1.
+        "track_background_processes": False,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
