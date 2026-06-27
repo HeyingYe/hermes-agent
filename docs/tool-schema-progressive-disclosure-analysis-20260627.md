@@ -73,13 +73,15 @@ computer_use
 
 ## 2. 真实 schema 成本数据
 
-主数据命令：
+主数据命令（脚本默认会临时剥离 `HERMES_KANBAN_TASK` / `HERMES_KANBAN_RUN_ID` / `HERMES_KANBAN_CLAIM_LOCK`，因此即使从 worker 里运行也测量普通 session 成本）：
 
 ```bash
-env -u HERMES_KANBAN_TASK python scripts/tool_schema_cost_report.py --toolsets hermes-cli --format json --top 50
-env -u HERMES_KANBAN_TASK python scripts/tool_schema_cost_report.py --toolsets hermes-feishu --format json --top 60
-env -u HERMES_KANBAN_TASK python scripts/tool_schema_cost_report.py --toolsets all --format json --top 80
+python scripts/tool_schema_cost_report.py --toolsets hermes-cli --format json --top 50
+python scripts/tool_schema_cost_report.py --toolsets hermes-feishu --format json --top 60
+python scripts/tool_schema_cost_report.py --toolsets all --format json --top 80
 ```
+
+如需有意测量 worker-only board tool 成本，使用 `--include-worker-kanban`。
 
 运行时出现非阻塞警告：`named custom provider 'subcode' has no resolvable api_key`。该警告来自本地模型/provider 配置解析，不影响 tool schema 静态统计。
 

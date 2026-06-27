@@ -91,6 +91,6 @@ Interpretation:
 1. Keep `jarvis_architecture_guard.py` as a local CI/pre-commit-style check for Jarvis/Hermes branches.
 2. Run it in non-strict mode now; treat warnings as migration backlog.
 3. After Kanban watcher/bridge registration moves into Jarvis distribution, turn the env-shim warnings into errors or remove the shim scanner.
-4. Run `tool_schema_cost_report.py` before and after any toolset/core-schema changes.
+4. Run `tool_schema_cost_report.py` before and after any toolset/core-schema changes. By default it strips worker-only board env so the reported cost represents normal platform sessions; pass `--include-worker-kanban` only when intentionally measuring worker tools.
 5. For schema reduction, first target wording and progressive disclosure, not capability deletion.
 6. Any default toolset/posture change must run CLI, gateway, cron, profile, and Feishu-focused regression tests.

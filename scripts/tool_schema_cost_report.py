@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -41,6 +43,39 @@ CORE_TOOLSETS = {
     "computer_use",
     "homeassistant",
 }
+
+_WORKER_KANBAN_ENV_VARS = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+)
+
+
+@contextmanager
+def non_worker_schema_environment(include_worker_kanban: bool = False):
+    """Temporarily hide worker-only Kanban env while measuring normal schemas.
+
+    Dispatcher-spawned workers receive ``HERMES_KANBAN_TASK`` and
+    ``model_tools.get_tool_definitions()`` intentionally appends the explicit
+    ``kanban`` toolset for those sessions. Schema cost reports are usually used
+    to reason about normal CLI/gateway platform cost, so the CLI strips those
+    env vars by default. Pass ``--include-worker-kanban`` to measure worker-only
+    board tools intentionally.
+    """
+    if include_worker_kanban:
+        yield
+        return
+    previous = {name: os.environ.get(name) for name in _WORKER_KANBAN_ENV_VARS}
+    try:
+        for name in _WORKER_KANBAN_ENV_VARS:
+            os.environ.pop(name, None)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def schema_json(tool_def: Mapping[str, Any]) -> str:
@@ -142,7 +177,12 @@ def summarize_tool_schemas(
     return summary
 
 
-def collect_tool_schema_report(enabled_toolsets: Sequence[str] | None = None, *, top_n: int = 15) -> dict:
+def collect_tool_schema_report(
+    enabled_toolsets: Sequence[str] | None = None,
+    *,
+    top_n: int = 15,
+    include_worker_kanban: bool = False,
+) -> dict:
     """Resolve live Hermes tool schemas and summarize their size.
 
     Uses ``skip_tool_search_assembly=True`` so the report measures the raw tool
@@ -150,11 +190,12 @@ def collect_tool_schema_report(enabled_toolsets: Sequence[str] | None = None, *,
     """
     from model_tools import TOOL_TO_TOOLSET_MAP, get_tool_definitions
 
-    tool_defs = get_tool_definitions(
-        enabled_toolsets=list(enabled_toolsets) if enabled_toolsets else None,
-        quiet_mode=True,
-        skip_tool_search_assembly=True,
-    )
+    with non_worker_schema_environment(include_worker_kanban=include_worker_kanban):
+        tool_defs = get_tool_definitions(
+            enabled_toolsets=list(enabled_toolsets) if enabled_toolsets else None,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
     return summarize_tool_schemas(
         tool_defs,
         toolset_map=TOOL_TO_TOOLSET_MAP,
@@ -209,6 +250,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated toolsets to measure. Use 'all' for every enabled toolset path (default: hermes-cli).",
     )
     parser.add_argument("--top", type=int, default=15, help="Number of largest tools to show")
+    parser.add_argument(
+        "--include-worker-kanban",
+        action="store_true",
+        help=(
+            "Include worker-only kanban tools when HERMES_KANBAN_TASK is set. "
+            "By default worker env is stripped so reports measure normal platform cost."
+        ),
+    )
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     parser.add_argument("--output", type=Path, default=None, help="Optional output file path")
     return parser
@@ -217,7 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     enabled = None if args.toolsets.strip().lower() == "all" else _parse_toolsets(args.toolsets)
-    summary = collect_tool_schema_report(enabled, top_n=args.top)
+    summary = collect_tool_schema_report(
+        enabled,
+        top_n=args.top,
+        include_worker_kanban=bool(args.include_worker_kanban),
+    )
     text = format_json(summary) if args.format == "json" else format_markdown(summary)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

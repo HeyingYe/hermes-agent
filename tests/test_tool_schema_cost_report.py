@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -113,3 +114,58 @@ def test_script_entrypoint_imports_repo_modules_from_scripts_directory():
     payload = json.loads(run.stdout)
     assert payload["toolsets"] == ["coding"]
     assert payload["total_tools"] > 0
+
+
+def test_script_entrypoint_ignores_worker_kanban_env_by_default():
+    env = os.environ.copy()
+    env["HERMES_KANBAN_TASK"] = "t_testworker"
+    env["HERMES_KANBAN_RUN_ID"] = "123"
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--toolsets",
+            "hermes-cli",
+            "--format",
+            "json",
+            "--top",
+            "50",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert run.returncode == 0, run.stderr
+    payload = json.loads(run.stdout)
+    assert "kanban" not in payload["by_toolset"]
+
+
+def test_script_entrypoint_can_include_worker_kanban_env_when_requested():
+    env = os.environ.copy()
+    env["HERMES_KANBAN_TASK"] = "t_testworker"
+    env["HERMES_KANBAN_RUN_ID"] = "123"
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--toolsets",
+            "hermes-cli",
+            "--include-worker-kanban",
+            "--format",
+            "json",
+            "--top",
+            "50",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert run.returncode == 0, run.stderr
+    payload = json.loads(run.stdout)
+    assert payload["by_toolset"]["kanban"]["tool_count"] > 0
