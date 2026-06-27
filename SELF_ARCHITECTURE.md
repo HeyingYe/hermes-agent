@@ -6,6 +6,7 @@ Related mirrors / context:
 
 - Lark Docx architecture map: `GvRydaFa6otejlx1JdMj1a6vpqf`.
 - Local audit and optimization note: `docs/jarvis-hermes-architecture-optimization-20260627.md`.
+- Jarvis product distribution boundary and migration plan: `docs/jarvis-product-distribution-boundary-20260627.md`.
 - Contributor guardrails: `AGENTS.md`.
 
 If this file and code disagree, treat the code and tests as the immediate source of truth, then update this file in the same change that changes runtime architecture.

@@ -330,7 +330,7 @@ class TestLoadConfig(unittest.TestCase):
             json.dump(raw, f)
             path = Path(f.name)
         try:
-            with patch("gateway.platforms.feishu_comment_rules._rules_cache", _MtimeCache(path)):
+            with patch("plugins.platforms.feishu.feishu_comment_rules._rules_cache", _MtimeCache(path)):
                 cfg = load_config()
             self.assertFalse(cfg.require_mention)
             self.assertTrue(cfg.documents["docx:abc"].require_mention)

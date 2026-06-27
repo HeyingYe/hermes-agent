@@ -73,6 +73,7 @@
 - 定义 Jarvis distribution manifest：产品 plugin、sidecar、profile template、cron template、skill bundle、Dashboard extension、migration script 的归属与版本。
 - 把当前兼容层作为 migration bridge：`gateway/background_services.py` 和 `tools/kanban_background_bridge.py` 继续存在，但明确标注为 built-in compatibility subscriber/service。
 - 下一步把 Kanban watcher/bridge 的注册入口迁到 Jarvis plugin/distribution module，Hermes engine 只暴露 generic service/subscriber API。
+- 设计文档已落地：`docs/jarvis-product-distribution-boundary-20260627.md`，包含 ownership model、manifest shape、迁移阶段、文件归属、rollback 与测试矩阵。
 - 设计用户 overlay 保护：Jarvis update 只能建议/迁移 schema，不能覆盖 Boss 私有 cron、profiles、skills、scripts、secrets。
 - Profile 职责明确：`default` 为主会话与入口；`jarviscode`、`jarvisresearch`、`jarvisreview` 为 worker profile；运行实例由 gateway/dispatcher/手动启动决定。
 

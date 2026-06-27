@@ -158,16 +158,16 @@ class TestMentionGate(unittest.TestCase):
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
 
-    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
-    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=True)
-    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
-    @patch("gateway.platforms.feishu_comment_rules.load_config")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.has_wiki_keys", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed", return_value=True)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
     def test_non_mentioned_dropped_before_access_control(
         self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys,
     ):
         """require_mention=true + is_mentioned=false → drop before access-control and any API call."""
-        from gateway.platforms.feishu_comment import handle_drive_comment_event
-        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+        from plugins.platforms.feishu.feishu_comment_rules import ResolvedCommentRule
 
         mock_resolve.return_value = ResolvedCommentRule(
             True, "pairing", frozenset(), "top", require_mention=True,
@@ -181,16 +181,16 @@ class TestMentionGate(unittest.TestCase):
         mock_allowed.assert_not_called()
         client.request.assert_not_called()
 
-    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
-    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=False)
-    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
-    @patch("gateway.platforms.feishu_comment_rules.load_config")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.has_wiki_keys", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
     def test_mentioned_proceeds_to_access_control(
         self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys,
     ):
         """require_mention=true + is_mentioned=true → mention gate passes, access-control runs."""
-        from gateway.platforms.feishu_comment import handle_drive_comment_event
-        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+        from plugins.platforms.feishu.feishu_comment_rules import ResolvedCommentRule
 
         mock_resolve.return_value = ResolvedCommentRule(
             True, "pairing", frozenset(), "top", require_mention=True,
@@ -202,16 +202,16 @@ class TestMentionGate(unittest.TestCase):
 
         mock_allowed.assert_called_once()
 
-    @patch("gateway.platforms.feishu_comment_rules.has_wiki_keys", return_value=False)
-    @patch("gateway.platforms.feishu_comment_rules.is_user_allowed", return_value=False)
-    @patch("gateway.platforms.feishu_comment_rules.resolve_rule")
-    @patch("gateway.platforms.feishu_comment_rules.load_config")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.has_wiki_keys", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.is_user_allowed", return_value=False)
+    @patch("plugins.platforms.feishu.feishu_comment_rules.resolve_rule")
+    @patch("plugins.platforms.feishu.feishu_comment_rules.load_config")
     def test_require_mention_false_allows_non_mentioned(
         self, mock_load, mock_resolve, mock_allowed, mock_wiki_keys,
     ):
         """require_mention=false for an exact doc → non-mentioned event still reaches access-control."""
-        from gateway.platforms.feishu_comment import handle_drive_comment_event
-        from gateway.platforms.feishu_comment_rules import ResolvedCommentRule
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+        from plugins.platforms.feishu.feishu_comment_rules import ResolvedCommentRule
 
         mock_resolve.return_value = ResolvedCommentRule(
             True, "pairing", frozenset(), "exact:docx:docx_token", require_mention=False,
