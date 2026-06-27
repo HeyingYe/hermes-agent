@@ -83,3 +83,64 @@ def test_text_formatter_summarizes_error_and_warning_counts(tmp_path):
     assert "errors=0" in output
     assert "warnings=1" in output
     assert "internal-env-compat-shim" in output
+
+
+def test_detects_product_terms_in_engine_core_files(tmp_path):
+    guard = _load_guard_module()
+    (tmp_path / "run_agent.py").write_text(
+        'def build_prompt():\n    return "Open the Jarvis Dashboard"\n',
+        encoding="utf-8",
+    )
+
+    issues = guard.scan_repository(tmp_path)
+
+    assert any(
+        issue.severity == "warning"
+        and issue.code == "product-term-in-engine-file"
+        and issue.match == "Jarvis"
+        for issue in issues
+    )
+    assert any(issue.code == "product-term-in-engine-file" and issue.match == "Dashboard" for issue in issues)
+
+
+def test_detects_user_facing_non_secret_hermes_behavior_env_vars(tmp_path):
+    guard = _load_guard_module()
+    docs = tmp_path / "docs" / "feature.md"
+    docs.parent.mkdir(parents=True)
+    docs.write_text(
+        "Set HERMES_ENABLE_WIDGETS=1 in your shell to turn on widgets.\n"
+        "Set HERMES_API_KEY for the credential.\n",
+        encoding="utf-8",
+    )
+
+    issues = guard.scan_repository(tmp_path)
+
+    assert any(
+        issue.severity == "warning"
+        and issue.code == "non-secret-hermes-env-behavior-config"
+        and issue.match == "HERMES_ENABLE_WIDGETS"
+        for issue in issues
+    )
+    assert not any(issue.match == "HERMES_API_KEY" for issue in issues)
+
+
+def test_detects_tool_schema_budget_regression(tmp_path):
+    guard = _load_guard_module()
+    report = tmp_path / "docs" / "tool-schema-cost-report-20260627.md"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        "# Tool Schema Cost Report\n\n"
+        "Total tools: 45\n"
+        "Total schema chars: 90000\n"
+        "Estimated tokens: 22500\n",
+        encoding="utf-8",
+    )
+
+    issues = guard.scan_repository(tmp_path)
+
+    assert any(
+        issue.severity == "warning"
+        and issue.code == "tool-schema-budget-regression"
+        and "22500" in issue.message
+        for issue in issues
+    )

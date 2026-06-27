@@ -43,7 +43,35 @@ _STALE_USER_HOME_RE = re.compile(r"/Users/heyingye/\.hermes")
 _INTERNAL_ENV_RE = re.compile(
     r"\bHERMES_KANBAN_(?:TRACK_BACKGROUND|DISPATCH_IN_GATEWAY)\b"
 )
-_PRODUCT_TERM_RE = re.compile(r"Jarvis Dashboard")
+_PRODUCT_TERM_RE = re.compile(r"\b(?:Jarvis|Kanban|Dashboard)\b")
+_HERMES_ENV_RE = re.compile(r"\b(HERMES_[A-Z0-9_]+)\b")
+_SECRET_ENV_FRAGMENT_RE = re.compile(
+    r"(?:API_)?KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|AUTH|OAUTH|JWT|BEARER",
+    re.IGNORECASE,
+)
+_ALLOWED_NON_BEHAVIOR_ENV_VARS = {
+    "HERMES_HOME",
+    "HERMES_UID",
+    "HERMES_GID",
+    "HERMES_ARGS",
+    "HERMES_MODEL",
+}
+_ALLOWED_NON_BEHAVIOR_ENV_SUFFIXES = ("_PATH", "_DIR", "_DIRECTORY", "_URL", "_URI")
+_USER_FACING_ENV_SKIP_DIRS = {
+    "apps",
+    "docker",
+    "optional-skills",
+    "plugins",
+    "skills",
+    "website",
+}
+_USER_FACING_CONFIG_HINT_RE = re.compile(
+    r"\b(?:export|set)\s+(?:HERMES_[A-Z0-9_]+)\s*=",
+    re.IGNORECASE,
+)
+_TOOL_SCHEMA_REPORT_RE = re.compile(r"tool-schema-cost-report.*\.md$")
+_SCHEMA_METRIC_RE = re.compile(r"^Estimated tokens:\s*(?P<tokens>[\d,]+)\s*$", re.MULTILINE)
+_TOOL_SCHEMA_TOKEN_WARNING_THRESHOLD = 20_000
 
 _ENGINE_PRODUCT_TERM_FILES = (
     "toolsets.py",
@@ -185,6 +213,77 @@ def _scan_product_terms(root: Path) -> list[ArchitectureIssue]:
     return issues
 
 
+def _is_secret_env_var(name: str) -> bool:
+    return bool(_SECRET_ENV_FRAGMENT_RE.search(name))
+
+
+def _is_allowed_non_behavior_env_var(name: str) -> bool:
+    return name in _ALLOWED_NON_BEHAVIOR_ENV_VARS or name.endswith(_ALLOWED_NON_BEHAVIOR_ENV_SUFFIXES)
+
+
+def _scan_user_facing_non_secret_hermes_env(root: Path) -> list[ArchitectureIssue]:
+    issues: list[ArchitectureIssue] = []
+    for path in _iter_text_files(root):
+        rel_path = _rel(root, path)
+        # Python files can legitimately contain internal env bridges; this guard
+        # is aimed at primary repo docs/scripts that teach behavior via HERMES_*.
+        if path.suffix == ".py" or any(part in _USER_FACING_ENV_SKIP_DIRS for part in rel_path.parts):
+            continue
+        text = _read_text(path)
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            if not _USER_FACING_CONFIG_HINT_RE.search(line):
+                continue
+            for match in _HERMES_ENV_RE.finditer(line):
+                env_name = match.group(1)
+                if _is_secret_env_var(env_name) or _is_allowed_non_behavior_env_var(env_name):
+                    continue
+                issues.append(
+                    ArchitectureIssue(
+                        severity="warning",
+                        code="non-secret-hermes-env-behavior-config",
+                        path=rel_path,
+                        line=line_no,
+                        message=(
+                            f"User-facing non-secret Hermes behavior setting {env_name!r} found. "
+                            "Behavior config belongs in config.yaml, setup/profile manifests, "
+                            "or an internal bridge rather than user .env/shell instructions."
+                        ),
+                        match=env_name,
+                    )
+                )
+    return issues
+
+
+def _scan_tool_schema_budget_reports(root: Path) -> list[ArchitectureIssue]:
+    issues: list[ArchitectureIssue] = []
+    for path in _iter_text_files(root):
+        rel_path = _rel(root, path)
+        if not _TOOL_SCHEMA_REPORT_RE.search(str(rel_path)):
+            continue
+        text = _read_text(path)
+        match = _SCHEMA_METRIC_RE.search(text)
+        if not match:
+            continue
+        tokens = int(match.group("tokens").replace(",", ""))
+        if tokens <= _TOOL_SCHEMA_TOKEN_WARNING_THRESHOLD:
+            continue
+        issues.append(
+            ArchitectureIssue(
+                severity="warning",
+                code="tool-schema-budget-regression",
+                path=rel_path,
+                line=_line_for_offset(text, match.start("tokens")),
+                message=(
+                    f"Tool schema report estimates {tokens} tokens, above the "
+                    f"{_TOOL_SCHEMA_TOKEN_WARNING_THRESHOLD} token review threshold. "
+                    "Investigate schema growth before adding model-facing tools."
+                ),
+                match=str(tokens),
+            )
+        )
+    return issues
+
+
 def _scan_internal_env_shims(root: Path) -> list[ArchitectureIssue]:
     issues: list[ArchitectureIssue] = []
     for rel_path in _INTERNAL_ENV_FILES:
@@ -221,6 +320,8 @@ def scan_repository(root: str | Path = ".") -> list[ArchitectureIssue]:
     issues.extend(_scan_default_on_kanban_side_effects(root))
     issues.extend(_scan_stale_user_home(root))
     issues.extend(_scan_product_terms(root))
+    issues.extend(_scan_user_facing_non_secret_hermes_env(root))
+    issues.extend(_scan_tool_schema_budget_reports(root))
     issues.extend(_scan_internal_env_shims(root))
     return sorted(issues, key=lambda i: (i.severity != "error", str(i.path), i.line, i.code))
 

@@ -102,6 +102,7 @@
 
 - 已完成：新增 `scripts/tool_schema_cost_report.py`，以真实 `model_tools.get_tool_definitions(..., skip_tool_search_assembly=True)` 输出统计 model-facing schema 成本。
 - 已完成：输出 `docs/tool-schema-cost-report-20260627.md`，记录 `hermes-cli` 29 tools / 57,478 schema chars / ~14,370 tokens。
+- 已完成：补充 worker 产物 `docs/tool-schema-progressive-disclosure-analysis-20260627.md`，区分非 worker session 与 `HERMES_KANBAN_TASK` worker session，记录 Kanban worker-only schema 成本约 ~3,305 tokens，并给出渐进披露 rollout/测试矩阵。
 - 已完成：补充 `coding` 与 `hermes-feishu` 真实数据：`coding` 26 tools / 46,442 chars / ~11,611 tokens；`hermes-feishu` 34 tools / 60,479 chars / ~15,120 tokens。
 - 结论：当前最大 schema 成本来自 `cronjob`、`delegate_task`、`session_search`、`terminal`、`skill_manage` 等合法核心能力，不应直接删除；下一步优先做 schema 描述压缩、渐进披露和 profile/posture shadow rollout。
 - 后续 rollout：先度量、再 shadow、再 opt-in、最后考虑默认变更。

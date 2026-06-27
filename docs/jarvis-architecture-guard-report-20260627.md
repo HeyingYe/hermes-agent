@@ -19,23 +19,26 @@ Command:
 python scripts/jarvis_architecture_guard.py --root . --format text
 ```
 
-Observed result:
+Observed result after the latest guard expansion:
 
 ```text
-Jarvis architecture guard: errors=0 warnings=8
+Jarvis architecture guard: errors=0 warnings=24
 ```
 
 Warnings by code:
 
+- `product-term-in-engine-file`: 16
 - `internal-env-compat-shim`: 8
 
 Interpretation:
 
 - There are no blocking architecture errors in the current branch.
-- The 8 warnings are the known Kanban compatibility env shims:
+- The 24 warnings are migration signals, not release blockers in non-strict mode.
+- `product-term-in-engine-file` warnings come from the expanded product-term scanner for `Jarvis`, `Kanban`, or `Dashboard` in engine-owned files. They identify future P1/P2 cleanup targets and should not be treated as blockers while compatibility bridges remain.
+- `internal-env-compat-shim` warnings are the known Kanban compatibility env shims:
   - `HERMES_KANBAN_DISPATCH_IN_GATEWAY`
   - `HERMES_KANBAN_TRACK_BACKGROUND`
-- These shims are acceptable only as internal compatibility bridges during the P1 migration. User-facing non-secret behavior must remain in `config.yaml` / Jarvis distribution manifests.
+- The high-signal non-secret `HERMES_*` scanner is enabled but currently produces no warnings in this checkout; it only targets explicit user-facing `set/export HERMES_...=` instructions outside skipped app/plugin/docker/website/skill trees.
 
 ## Guarded invariants
 
@@ -47,7 +50,9 @@ The script currently fails on:
 
 The script warns on:
 
-- `Jarvis Dashboard` product wording inside engine-owned files.
+- `Jarvis`, `Kanban`, or `Dashboard` product wording inside engine-owned files.
+- User-facing, non-secret `HERMES_*` behavior toggles in primary repo docs/scripts, excluding path/identity/credential variables and generated website/skill docs.
+- Tool schema reports whose estimated token count crosses the review threshold.
 - Internal Kanban compatibility env shims that must not become user-facing config.
 
 ## Tool schema cost result
