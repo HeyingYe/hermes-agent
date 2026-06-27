@@ -2123,7 +2123,7 @@ class TestAdapterBehavior(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_send_with_retry_sanitizes_feishu_topic_metadata_after_field_validation_failure(self):
         from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
         captured = []
@@ -2151,7 +2151,7 @@ class TestAdapterBehavior(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             result = asyncio.run(
                 adapter._send_with_retry(
                     chat_id="oc_chat",
