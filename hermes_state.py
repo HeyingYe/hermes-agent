@@ -4675,6 +4675,149 @@ class SessionDB:
             sessions.append(session)
         return sessions
 
+    # ── Feishu DM topic bindings ──────────────────────────────────────────
+    # Feishu private chats can run each 话题 (topic, thread_id ``omt_…``) as an
+    # independent Hermes session.  Unlike Telegram (where the user creates the
+    # topic), the bot creates the topic via a threaded first reply, so the
+    # binding is written AFTER the reply returns the new thread_id.  The table
+    # mirrors ``telegram_dm_topic_bindings`` so the run.py resolution logic is
+    # symmetric.
+
+    def apply_feishu_topic_migration(self) -> None:
+        """Create the Feishu DM topic-binding table (idempotent)."""
+        def _do(conn):
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_dm_topic_bindings (
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    managed_mode TEXT NOT NULL DEFAULT 'auto',
+                    linked_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, thread_id)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_feishu_dm_topic_bindings_session
+                ON feishu_dm_topic_bindings(session_id);
+
+                CREATE INDEX IF NOT EXISTS idx_feishu_dm_topic_bindings_user
+                ON feishu_dm_topic_bindings(user_id, chat_id);
+                """
+            )
+        self._execute_write(_do)
+
+    def get_feishu_topic_binding(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the session binding for a Feishu DM topic, if present."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM feishu_dm_topic_bindings
+                    WHERE chat_id = ? AND thread_id = ?
+                    """,
+                    (str(chat_id), str(thread_id)),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
+    def get_feishu_topic_binding_by_session(
+        self,
+        *,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Reverse lookup: Feishu topic binding for a given session_id, if any."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM feishu_dm_topic_bindings WHERE session_id = ?",
+                    (str(session_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
+    def list_feishu_topic_bindings_for_chat(
+        self,
+        *,
+        chat_id: str,
+    ) -> List[Dict[str, Any]]:
+        """All Feishu DM topic bindings for one chat, newest first (read-only)."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT * FROM feishu_dm_topic_bindings "
+                    "WHERE chat_id = ? ORDER BY updated_at DESC",
+                    (str(chat_id),),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def bind_feishu_topic(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+        user_id: str,
+        session_key: str,
+        session_id: str,
+        managed_mode: str = "auto",
+    ) -> None:
+        """Bind one Feishu DM topic thread to one Hermes session.
+
+        A Hermes session may only be linked to one Feishu topic.  Rebinding the
+        same topic to the same session is idempotent; linking the same session
+        to a different topic raises ValueError.
+        """
+        self.apply_feishu_topic_migration()
+        now = time.time()
+        chat_id = str(chat_id)
+        thread_id = str(thread_id)
+        user_id = str(user_id)
+        session_key = str(session_key)
+        session_id = str(session_id)
+
+        def _do(conn):
+            existing_session = conn.execute(
+                "SELECT chat_id, thread_id FROM feishu_dm_topic_bindings "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if existing_session is not None:
+                linked_chat = existing_session["chat_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[0]
+                linked_thread = existing_session["thread_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[1]
+                if str(linked_chat) != chat_id or str(linked_thread) != thread_id:
+                    raise ValueError("session is already linked to another Feishu topic")
+
+            conn.execute(
+                """
+                INSERT INTO feishu_dm_topic_bindings (
+                    chat_id, thread_id, user_id, session_key, session_id,
+                    managed_mode, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    session_key = excluded.session_key,
+                    session_id = excluded.session_id,
+                    managed_mode = excluded.managed_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id, thread_id, user_id, session_key, session_id,
+                    managed_mode, now, now,
+                ),
+            )
+        self._execute_write(_do)
+
     # ── Space reclamation ──
 
     # FTS5 virtual tables whose b-tree segments we merge on optimize. The

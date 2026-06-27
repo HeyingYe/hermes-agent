@@ -18,7 +18,11 @@ from tools.process_registry import (
     ProcessSession,
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
-    _kanban_bridge_enabled,
+    _BACKGROUND_PROCESS_SUBSCRIBERS,
+    _emit_background_process_event,
+    _maybe_register_optional_background_process_subscribers,
+    register_background_process_subscriber,
+    unregister_background_process_subscriber,
 )
 
 
@@ -105,68 +109,63 @@ def test_write_stdin_uses_bytes_for_posix_pty(monkeypatch, registry):
     assert written == [b"hello\n"]
 
 
-def test_kanban_background_bridge_defaults_on(monkeypatch):
-    """Jarvis Dashboard should see ad-hoc concurrent/background tasks by default."""
-    monkeypatch.delenv("HERMES_KANBAN_TRACK_BACKGROUND", raising=False)
-    import hermes_cli.config as config
-    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {}})
+def test_background_process_event_subscriber_receives_lifecycle_events():
+    events = []
 
-    assert _kanban_bridge_enabled() is True
+    def _subscriber(event):
+        events.append((event.kind, event.session.id))
+
+    session = _make_session(sid="proc_events")
+    register_background_process_subscriber(_subscriber)
+    try:
+        _emit_background_process_event("started", session)
+        _emit_background_process_event("finished", session)
+    finally:
+        unregister_background_process_subscriber(_subscriber)
+
+    assert events == [("started", "proc_events"), ("finished", "proc_events")]
 
 
-def test_kanban_background_bridge_env_can_disable(monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_TRACK_BACKGROUND", "0")
-
-    assert _kanban_bridge_enabled() is False
-
-
-def test_kanban_background_bridge_finishes_already_exited_session(monkeypatch):
-    """Fast processes can exit before their Kanban card is created; close the card."""
+def test_background_process_event_subscriber_errors_are_best_effort():
     calls = []
 
-    class _Conn:
-        def execute(self, query, params=()):
-            calls.append(("execute", query, params))
+    def _bad_subscriber(event):
+        calls.append(event.kind)
+        raise RuntimeError("subscriber failed")
 
-    @contextmanager
-    def _connect_closing():
-        yield _Conn()
+    session = _make_session(sid="proc_bad_subscriber")
+    register_background_process_subscriber(_bad_subscriber)
+    try:
+        _emit_background_process_event("started", session)
+    finally:
+        unregister_background_process_subscriber(_bad_subscriber)
 
-    @contextmanager
-    def _write_txn(conn):
-        yield conn
+    assert calls == ["started"]
 
-    def _create_task(conn, **kwargs):
-        calls.append(("create", kwargs))
-        return "t_bgfast"
 
-    def _complete_task(conn, task_id, **kwargs):
-        calls.append(("complete", task_id, kwargs))
-        return True
+def test_optional_background_subscribers_default_off(monkeypatch):
+    """Generic process registry import path should not register product subscribers."""
+    monkeypatch.delenv("HERMES_KANBAN_TRACK_BACKGROUND", raising=False)
+    import hermes_cli.config as config
 
-    monkeypatch.setattr(process_registry, "_kanban_bridge_enabled", lambda: True)
-    monkeypatch.setattr("hermes_cli.kanban_db.connect_closing", _connect_closing)
-    monkeypatch.setattr("hermes_cli.kanban_db.write_txn", _write_txn)
-    monkeypatch.setattr("hermes_cli.kanban_db.create_task", _create_task)
-    monkeypatch.setattr("hermes_cli.kanban_db.complete_task", _complete_task)
+    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {}})
+    before = list(_BACKGROUND_PROCESS_SUBSCRIBERS)
 
-    session = ProcessSession(
-        id="proc_fast",
-        command="python -c 'print(1)'",
-        exited=True,
-        exit_code=0,
-    )
+    _maybe_register_optional_background_process_subscribers()
 
-    process_registry._kanban_bridge_create(session)
+    assert _BACKGROUND_PROCESS_SUBSCRIBERS == before
 
-    assert session.kanban_task_id == "t_bgfast"
-    assert any(call[0] == "create" for call in calls)
-    assert any(
-        call[0] == "complete"
-        and call[1] == "t_bgfast"
-        and call[2]["result"] == "exit_code=0"
-        for call in calls
-    )
+
+def test_optional_background_subscribers_can_opt_in(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TRACK_BACKGROUND", "1")
+    from tools.kanban_background_bridge import kanban_background_process_subscriber
+
+    unregister_background_process_subscriber(kanban_background_process_subscriber)
+    try:
+        _maybe_register_optional_background_process_subscribers()
+        assert kanban_background_process_subscriber in _BACKGROUND_PROCESS_SUBSCRIBERS
+    finally:
+        unregister_background_process_subscriber(kanban_background_process_subscriber)
 
 
 # =========================================================================

@@ -10,6 +10,8 @@ parity across every registered verb.
 
 from __future__ import annotations
 
+from gateway.kanban_watchers import _RunnerBackedKanbanWatchers
+
 import argparse
 import json
 import os
@@ -3362,20 +3364,25 @@ def test_legacy_migration_both_columns_already_present(tmp_path):
 # Gateway-embedded dispatcher: config, CLI warnings, daemon deprecation stub
 # ---------------------------------------------------------------------------
 
-def test_config_default_dispatch_in_gateway_is_true():
-    """Default config must enable gateway-embedded dispatch out of the box.
-    Flipping this default to false is a user-visible behaviour change and
-    should require a conscious migration."""
+def test_config_default_dispatch_in_gateway_is_false():
+    """Generic Hermes gateways should not spawn Kanban workers unless opted in."""
     from hermes_cli.config import DEFAULT_CONFIG
     kanban = DEFAULT_CONFIG.get("kanban", {})
-    assert kanban.get("dispatch_in_gateway") is True, (
-        "kanban.dispatch_in_gateway default should be True; got "
+    assert kanban.get("dispatch_in_gateway") is False, (
+        "kanban.dispatch_in_gateway default should be False; got "
         f"{kanban.get('dispatch_in_gateway')!r}"
     )
     interval = kanban.get("dispatch_interval_seconds")
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+
+
+def test_config_background_tracking_defaults_off():
+    """Generic Hermes background processes should not mirror to Kanban by default."""
+    from hermes_cli.config import DEFAULT_CONFIG
+    kanban = DEFAULT_CONFIG.get("kanban", {})
+    assert kanban.get("track_background_processes") is False
 
 
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
@@ -3565,7 +3572,7 @@ def test_gateway_dispatcher_watcher_respects_config_flag_off(monkeypatch):
     )
     asyncio.run(
         asyncio.wait_for(
-            runner._kanban_dispatcher_watcher(),
+            _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher(),
             timeout=3.0,
         )
     )
@@ -3581,16 +3588,14 @@ def test_gateway_dispatcher_watcher_respects_env_override(monkeypatch):
     runner._running = True
     asyncio.run(
         asyncio.wait_for(
-            runner._kanban_dispatcher_watcher(),
+            _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher(),
             timeout=3.0,
         )
     )
 
 
-def test_gateway_dispatcher_watcher_env_truthy_uses_config(monkeypatch):
-    """Truthy env value doesn't force-enable — config still decides.
-    (We only treat explicit falses as an override; unset or truthy
-    defers to config.)"""
+def test_gateway_dispatcher_watcher_env_truthy_enables(monkeypatch):
+    """HERMES_KANBAN_DISPATCH_IN_GATEWAY=yes enables without config opt-in."""
     import asyncio
     from gateway.run import GatewayRunner
     import hermes_cli.config as _cfg_mod
@@ -3603,11 +3608,14 @@ def test_gateway_dispatcher_watcher_env_truthy_uses_config(monkeypatch):
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    # config says false, env is truthy — watcher should still exit
-    # (because config is authoritative when env isn't a falsey override).
+
+    async def _sleep(_delay):
+        runner._running = False
+
+    monkeypatch.setattr("gateway.kanban_watchers.asyncio.sleep", _sleep)
     asyncio.run(
         asyncio.wait_for(
-            runner._kanban_dispatcher_watcher(),
+            _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher(),
             timeout=3.0,
         )
     )
@@ -3689,7 +3697,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     with caplog.at_level(logging.ERROR, logger="gateway.run"):
         asyncio.run(
             asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
+                _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher(),
                 timeout=3.0,
             )
         )
@@ -3787,7 +3795,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     with caplog.at_level(logging.INFO, logger="gateway.run"):
         asyncio.run(
             asyncio.wait_for(
-                runner._kanban_dispatcher_watcher(),
+                _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher(),
                 timeout=3.0,
             )
         )

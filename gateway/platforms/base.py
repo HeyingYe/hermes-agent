@@ -1555,6 +1555,12 @@ class SendResult:
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
+    # Thread/topic id of the message that was just sent, when the platform
+    # returns one.  Feishu populates this so that a threaded reply which
+    # *creates* a new 话题 (topic) hands the new ``omt_…`` id back to the
+    # caller, which binds it to the active session (see gateway/run.py
+    # feishu topic-lane handling).
+    thread_id: Optional[str] = None
     # Adapter-specific metadata.  Cross-layer contracts that affect delivery
     # semantics must be documented at the producer and consumer sites.  Current
     # known contract: Telegram edit overflow partials set

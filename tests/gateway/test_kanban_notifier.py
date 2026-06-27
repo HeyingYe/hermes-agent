@@ -1,3 +1,4 @@
+from gateway.kanban_watchers import _RunnerBackedKanbanWatchers
 import asyncio
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class DisconnectedAdapters(dict):
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "true")
     real_sleep = asyncio.sleep
 
     async def fake_sleep(delay):
@@ -32,7 +34,7 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    await _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher(interval=1)
 
 
 def _make_runner(adapter):

@@ -3122,7 +3122,13 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # NOTE: do NOT fall back to root_id here. root_id is set on every
+        # 引用回复 (quote-reply), and folding it into thread_id made each
+        # quote-reply spawn its own session (session.build_session_key's DM
+        # branch keys on thread_id). Only a real Feishu 话题 thread (omt_…)
+        # should define a session lane; root_id is still used as a reply
+        # anchor below.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -4459,9 +4465,15 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        _meta = metadata or {}
+        # ``create_feishu_topic`` asks the FIRST reply of a brand-new top-level
+        # DM session to open a 话题 (topic): we reply-in-thread to the user's
+        # message, which makes Feishu mint a new ``omt_…`` thread and return it
+        # on the response (captured into SendResult.thread_id).
+        _create_topic = bool(_meta.get("create_feishu_topic"))
+        if not effective_reply_to and (_meta.get("thread_id") or _create_topic):
+            effective_reply_to = _meta.get("reply_to_message_id")
+        reply_in_thread = bool(_meta.get("thread_id") or _create_topic)
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -4532,6 +4544,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return SendResult(
             success=True,
             message_id=self._extract_response_field(response, "message_id"),
+            thread_id=self._extract_response_field(response, "thread_id"),
             raw_response=response,
         )
 

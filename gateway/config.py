@@ -552,6 +552,13 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # Feishu DM "topic = session" mode (opt-out via feishu.topic_sessions: false).
+    # When True (default), each top-level Feishu DM starts its own session and the
+    # bot opens a 话题 (topic) for it; follow-ups inside that topic continue the
+    # same session. When False, Feishu DMs fall back to the legacy single rolling
+    # session per chat.
+    feishu_topic_sessions: bool = True
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -658,6 +665,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "feishu_topic_sessions": self.feishu_topic_sessions,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -724,6 +732,13 @@ class GatewayConfig:
             "pair",
         )
 
+        # feishu_topic_sessions: accept top-level key or nested feishu.topic_sessions.
+        feishu_topic_sessions = data.get("feishu_topic_sessions")
+        if feishu_topic_sessions is None:
+            _feishu_cfg = data.get("feishu")
+            if isinstance(_feishu_cfg, dict):
+                feishu_topic_sessions = _feishu_cfg.get("topic_sessions")
+
         try:
             session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
             session_store_max_age_days = max(session_store_max_age_days, 0)
@@ -746,6 +761,7 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            feishu_topic_sessions=_coerce_bool(feishu_topic_sessions, True),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),

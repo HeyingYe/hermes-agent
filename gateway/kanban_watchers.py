@@ -1,11 +1,9 @@
-"""Kanban board watcher methods for GatewayRunner.
+"""Optional Kanban gateway background services.
 
-Extracted verbatim from ``gateway/run.py`` (god-file decomposition Phase 3).
-These are the background-loop methods that subscribe to kanban boards, deliver
-notifications/artifacts, and drive the multi-agent dispatcher. They use only
-``self`` state, so they live on a mixin that ``GatewayRunner`` inherits — the
-``self._kanban_*`` call sites resolve identically via the MRO, making this a
-behavior-neutral move that lifts ~1,000 LOC out of run.py.
+The gateway core exposes a generic background-service seam. This module owns
+Kanban notifier/dispatcher watchers and registers them only when Kanban gateway
+dispatch is explicitly enabled, so generic gateway startup does not inherit or
+start Kanban-specific behavior.
 """
 
 from __future__ import annotations
@@ -75,8 +73,8 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
-class GatewayKanbanWatchersMixin:
-    """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+class GatewayKanbanWatchersService:
+    """Kanban watcher / notifier / dispatcher loops bound to a GatewayRunner."""
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -107,16 +105,25 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
-            return
+        cfg: Any | None = None
+        if env_override:
+            if env_override in {"0", "false", "no", "off"}:
+                logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+                return
+            if env_override in {"1", "true", "yes", "on"}:
+                cfg = {"kanban": {"dispatch_in_gateway": True}}
+            else:
+                cfg = None
+        else:
+            cfg = None
+        if cfg is None:
+            try:
+                cfg = _load_config()
+            except Exception as exc:
+                logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
+                return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -611,10 +618,11 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
+        Gated by `kanban.dispatch_in_gateway` in config.yaml (default False).
         When true, the gateway hosts the single dispatcher for this profile:
         no separate `hermes kanban daemon` process needed. When false, the
-        loop exits immediately and an external daemon is expected.
+        loop exits immediately and no Kanban DB polling or worker spawning
+        happens from the gateway.
 
         Each tick calls :func:`kanban_db.dispatch_once` inside
         ``asyncio.to_thread`` so the SQLite WAL lock never blocks the
@@ -629,24 +637,33 @@ class GatewayKanbanWatchersMixin:
         # Read config once at boot. If the user flips the flag later, they
         # restart the gateway; same pattern as every other background
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
-        # as an escape hatch (false-y value disables without editing YAML).
+        # as an internal compatibility escape hatch.
         try:
             from hermes_cli.config import load_config as _load_config
         except Exception:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
+        cfg: Any | None = None
+        if env_override:
+            if env_override in {"0", "false", "no", "off"}:
+                logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+                return
+            if env_override in {"1", "true", "yes", "on"}:
+                cfg = {"kanban": {"dispatch_in_gateway": True}}
+            else:
+                cfg = None
+        else:
+            cfg = None
 
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
-            return
+        if cfg is None:
+            try:
+                cfg = _load_config()
+            except Exception as exc:
+                logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
+                return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -1144,3 +1161,60 @@ class GatewayKanbanWatchersMixin:
 
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None
+
+
+class _RunnerBackedKanbanWatchers(GatewayKanbanWatchersService):
+    """Bind Kanban watcher methods to a GatewayRunner without inheritance."""
+
+    def __init__(self, runner: Any):
+        object.__setattr__(self, "_runner", runner)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runner, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_runner":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._runner, name, value)
+
+
+async def _run_kanban_notifier_service(runner: Any) -> None:
+    await _RunnerBackedKanbanWatchers(runner)._kanban_notifier_watcher()
+
+
+async def _run_kanban_dispatcher_service(runner: Any) -> None:
+    await _RunnerBackedKanbanWatchers(runner)._kanban_dispatcher_watcher()
+
+
+def _kanban_gateway_dispatch_enabled() -> bool:
+    """Return whether gateway-hosted Kanban services should be registered."""
+
+    env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+    if env_override in {"0", "false", "no", "off"}:
+        return False
+    if env_override in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from hermes_cli.config import load_config as _load_config
+        cfg = _load_config()
+    except Exception as exc:
+        logger.warning("kanban gateway services: cannot load config (%s); disabled", exc)
+        return False
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    return bool(kanban_cfg.get("dispatch_in_gateway", False))
+
+
+def register_kanban_gateway_background_services() -> bool:
+    """Register optional Kanban gateway services when explicitly enabled."""
+
+    if not _kanban_gateway_dispatch_enabled():
+        logger.info("kanban gateway services: disabled")
+        return False
+
+    from gateway.background_services import register_gateway_background_service
+
+    register_gateway_background_service("kanban-notifier", _run_kanban_notifier_service)
+    register_gateway_background_service("kanban-dispatcher", _run_kanban_dispatcher_service)
+    logger.info("kanban gateway services: registered notifier and dispatcher")
+    return True
